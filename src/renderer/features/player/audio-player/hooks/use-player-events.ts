@@ -10,6 +10,7 @@ import {
     subscribePlayerRepeat,
     subscribePlayerSeekToTimestamp,
     subscribePlayerShuffle,
+    subscribePlayerSongChange,
     subscribePlayerSpeed,
     subscribePlayerStatus,
     subscribePlayerVolume,
@@ -44,6 +45,10 @@ interface PlayerEventsCallbacks {
     onPlayerShuffle?: (
         properties: { shuffle: PlayerShuffle },
         prev: { shuffle: PlayerShuffle },
+    ) => void;
+    onPlayerSongChange?: (
+        properties: { currentSong: QueueSong | undefined; nextSong: QueueSong | undefined },
+        prev: { currentSong: QueueSong | undefined; nextSong: QueueSong | undefined },
     ) => void;
     onPlayerSpeed?: (properties: { speed: number }, prev: { speed: number }) => void;
     onPlayerStatus?: (properties: { status: PlayerStatus }, prev: { status: PlayerStatus }) => void;
@@ -147,6 +152,12 @@ function createPlayerEvents(callbacks: PlayerEventsCallbacks): PlayerEvents {
     // Subscribe to shuffle changes
     if (callbacks.onPlayerShuffle) {
         const unsubscribe = subscribePlayerShuffle(callbacks.onPlayerShuffle);
+        unsubscribers.push(unsubscribe);
+    }
+
+    // Subscribe to current or upcoming song changes (e.g. current song, next song, or shuffle/repeat/queue affecting next)
+    if (callbacks.onPlayerSongChange) {
+        const unsubscribe = subscribePlayerSongChange(callbacks.onPlayerSongChange);
         unsubscribers.push(unsubscribe);
     }
 

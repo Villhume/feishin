@@ -1779,6 +1779,57 @@ export const subscribeNextSongInsertion = (onChange: (song: QueueSong | undefine
     );
 };
 
+export const subscribePlayerSongChange = (
+    onChange: (
+        properties: {
+            currentSong: QueueSong | undefined;
+            nextSong: QueueSong | undefined;
+        },
+        prev: {
+            currentSong: QueueSong | undefined;
+            nextSong: QueueSong | undefined;
+        },
+    ) => void,
+) => {
+    return usePlayerStoreBase.subscribe(
+        (state) => {
+            const queue = state.getQueue();
+            let queueIndex = state.player.index;
+            const repeat = state.player.repeat;
+
+            if (isShuffleEnabled(state)) {
+                queueIndex = mapShuffledToQueueIndex(queueIndex, state.queue.shuffled);
+            }
+
+            const currentSong = queue.items[queueIndex];
+
+            let nextSong: QueueSong | undefined;
+            if (isShuffleEnabled(state)) {
+                const nextShuffledIndex = state.player.index + 1;
+                if (nextShuffledIndex < state.queue.shuffled.length) {
+                    const nextQueueIndex = state.queue.shuffled[nextShuffledIndex];
+                    nextSong = queue.items[nextQueueIndex];
+                } else if (repeat === PlayerRepeat.ALL) {
+                    const firstQueueIndex = state.queue.shuffled[0];
+                    nextSong = queue.items[firstQueueIndex];
+                }
+            } else {
+                nextSong = calculateNextSong(queueIndex, queue.items, repeat);
+            }
+
+            return { currentSong, nextSong };
+        },
+        (current, prev) => {
+            onChange(current, prev);
+        },
+        {
+            equalityFn: (a, b) =>
+                a.currentSong?._uniqueId === b.currentSong?._uniqueId &&
+                a.nextSong?._uniqueId === b.nextSong?._uniqueId,
+        },
+    );
+};
+
 export const subscribePlayerVolume = (
     onChange: (properties: { volume: number }, prev: { volume: number }) => void,
 ) => {
