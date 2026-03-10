@@ -1420,7 +1420,7 @@ export type ControllerEndpoint = {
     getStructuredLyrics?: (args: StructuredLyricsArgs) => Promise<StructuredLyric[]>;
     getTagList?: (args: TagListArgs) => Promise<TagListResponse>;
     getTopSongs: (args: TopSongListArgs) => Promise<TopSongListResponse>;
-    // getArtistInfo?: (args: any) => void;
+    getTranscodeDecision: (args: TranscodeDecisionArgs) => Promise<TranscodeDecisionResponse>;
     getUserInfo: (args: UserInfoArgs) => Promise<UserInfoResponse>;
     getUserList?: (args: UserListArgs) => Promise<UserListResponse>;
     movePlaylistItem?: (args: MoveItemArgs) => Promise<void>;
@@ -1568,6 +1568,9 @@ export type InternalControllerEndpoint = {
     ) => Promise<StructuredLyric[]>;
     getTagList?: (args: ReplaceApiClientProps<TagListArgs>) => Promise<TagListResponse>;
     getTopSongs: (args: ReplaceApiClientProps<TopSongListArgs>) => Promise<TopSongListResponse>;
+    getTranscodeDecision: (
+        args: ReplaceApiClientProps<TranscodeDecisionArgs>,
+    ) => Promise<TranscodeDecisionResponse>;
     getUserInfo: (args: ReplaceApiClientProps<UserInfoArgs>) => Promise<UserInfoResponse>;
     getUserList?: (args: ReplaceApiClientProps<UserListArgs>) => Promise<UserListResponse>;
     movePlaylistItem?: (args: ReplaceApiClientProps<MoveItemArgs>) => Promise<void>;
@@ -1654,7 +1657,10 @@ export type StreamQuery = {
     bitrate?: number;
     format?: string;
     id: string;
+    mediaType?: 'podcast' | 'song';
+    offset?: number;
     transcode: boolean;
+    transcodeParams?: string;
 };
 
 export type StructuredLyric = (StructuredSyncedLyric | StructuredUnsyncedLyric) & {
@@ -1696,6 +1702,50 @@ export type TagListResponse = {
         song: string[];
     };
     tags?: Tag[];
+};
+
+export type TranscodeDecisionArgs = BaseEndpointArgs & {
+    body?: TranscodeDecisionRequestBody;
+    query: TranscodeDecisionQuery;
+};
+
+export type TranscodeDecisionQuery = {
+    id: string;
+    type: 'song';
+};
+
+export type TranscodeDecisionRequestBody = {
+    codecProfiles?: Array<{
+        limitations?: Array<{
+            comparison: string;
+            name: string;
+            required?: boolean;
+            values: string[];
+        }>;
+        name: string;
+        type: string;
+    }>;
+    directPlayProfiles?: Array<{
+        audioCodecs: string[];
+        containers: string[];
+        maxAudioChannels?: number;
+        protocols: string[];
+    }>;
+    maxAudioBitrate?: number;
+    maxTranscodingAudioBitrate?: number;
+    name: string;
+    platform: string;
+    transcodingProfiles?: Array<{
+        audioCodec: string;
+        container: string;
+        maxAudioChannels?: number;
+        protocol: string;
+    }>;
+};
+
+export type TranscodeDecisionResponse = {
+    decision: 'direct' | 'transcode';
+    transcodeParams?: string;
 };
 
 export type UserInfoArgs = BaseEndpointArgs & { query: UserInfoQuery };

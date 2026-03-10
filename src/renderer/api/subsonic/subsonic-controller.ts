@@ -1802,9 +1802,22 @@ export const SubsonicController: InternalControllerEndpoint = {
         return totalRecordCount;
     },
     getStreamUrl: ({ apiClientProps: { server }, query }) => {
-        const { bitrate, format, id, transcode } = query;
-        let url = `${server?.url}/rest/stream.view?id=${id}&v=1.13.0&c=Feishin&${server?.credential}`;
+        const {
+            bitrate,
+            format,
+            id,
+            mediaType = 'song',
+            offset = 0,
+            transcode,
+            transcodeParams,
+        } = query;
 
+        if (transcodeParams != null) {
+            const q = `mediaId=${encodeURIComponent(id)}&mediaType=${mediaType}&offset=${offset}&transcodeParams=${transcodeParams}&v=1.13.0&c=Feishin`;
+            return `${server?.url}/rest/getTranscodeStream.view?${q}&${server?.credential}`;
+        }
+
+        let url = `${server?.url}/rest/stream.view?id=${id}&v=1.13.0&c=Feishin&${server?.credential}`;
         if (transcode) {
             if (format) {
                 url += `&format=${format}`;
@@ -1813,7 +1826,6 @@ export const SubsonicController: InternalControllerEndpoint = {
                 url += `&maxBitRate=${bitrate}`;
             }
         }
-
         return url;
     },
     getStructuredLyrics: async (args) => {
@@ -1909,6 +1921,32 @@ export const SubsonicController: InternalControllerEndpoint = {
             items: songsWithPlayCount,
             startIndex: 0,
             totalRecordCount: res.totalRecordCount,
+        };
+    },
+    getTranscodeDecision: async (args) => {
+        const { apiClientProps, body, query } = args;
+
+        const defaultBody = {
+            name: 'Feishin',
+            platform: 'Web',
+        };
+
+        const res = await ssApiClient(apiClientProps).getTranscodeDecision({
+            body: body ?? defaultBody,
+            query: {
+                mediaId: query.id,
+                mediaType: query.type === 'song' ? 'song' : 'podcast',
+            },
+        });
+
+        if (res.status !== 200) {
+            throw new Error('Failed to get transcode decision');
+        }
+
+        const td = res.body.transcodeDecision;
+        return {
+            decision: td.canDirectPlay ? 'direct' : 'transcode',
+            transcodeParams: td.transcodeParams,
         };
     },
     getUserInfo: async (args) => {

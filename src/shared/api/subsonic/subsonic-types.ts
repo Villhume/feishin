@@ -11,6 +11,80 @@ const userParameters = z.object({
     username: z.string(),
 });
 
+const transcodeDecisionParameters = z.object({
+    mediaId: z.string(),
+    mediaType: z.enum(['song', 'podcast']),
+});
+
+const getTranscodeStreamParameters = z.object({
+    mediaId: z.string(),
+    mediaType: z.enum(['song', 'podcast']),
+    offset: z.number().optional(),
+    transcodeParams: z.string(),
+});
+
+const codecProfileLimitation = z.object({
+    comparison: z.string(),
+    name: z.string(),
+    required: z.boolean().optional(),
+    values: z.array(z.string()),
+});
+
+const directPlayProfile = z.object({
+    audioCodecs: z.array(z.string()),
+    containers: z.array(z.string()),
+    maxAudioChannels: z.number().optional(),
+    protocols: z.array(z.string()),
+});
+
+const transcodingProfile = z.object({
+    audioCodec: z.string(),
+    container: z.string(),
+    maxAudioChannels: z.number().optional(),
+    protocol: z.string(),
+});
+
+const codecProfile = z.object({
+    limitations: z.array(codecProfileLimitation).optional(),
+    name: z.string(),
+    type: z.string(),
+});
+
+const transcodeDecisionRequestBody = z.object({
+    codecProfiles: z.array(codecProfile).optional(),
+    directPlayProfiles: z.array(directPlayProfile).optional(),
+    maxAudioBitrate: z.number().optional(),
+    maxTranscodingAudioBitrate: z.number().optional(),
+    name: z.string(),
+    platform: z.string(),
+    transcodingProfiles: z.array(transcodingProfile).optional(),
+});
+
+const streamDetails = z.object({
+    audioBitdepth: z.number().optional(),
+    audioBitrate: z.number().optional(),
+    audioChannels: z.number().optional(),
+    audioProfile: z.string().optional(),
+    audioSamplerate: z.number().optional(),
+    codec: z.string().optional(),
+    container: z.string().optional(),
+    protocol: z.string().optional(),
+});
+
+const transcodeDecision = z.object({
+    canDirectPlay: z.boolean(),
+    canTranscode: z.boolean(),
+    errorReason: z.string().optional(),
+    sourceStream: streamDetails.optional(),
+    transcodeParams: z.string().optional(),
+    transcodeReason: z.array(z.string()).optional(),
+    transcodeStream: streamDetails.optional(),
+});
+
+const getTranscodeDecision = z.object({
+    transcodeDecision,
+});
+
 const user = z.object({
     user: z.object({
         adminRole: z.boolean(),
@@ -716,6 +790,9 @@ const getInternetRadioStations = z.object({
 });
 
 export const ssType = {
+    _body: {
+        getTranscodeDecision: transcodeDecisionRequestBody,
+    },
     _parameters: {
         albumInfo: albumInfoParameters,
         albumList: albumListParameters,
@@ -739,6 +816,8 @@ export const ssType = {
         getSong: getSongParameters,
         getSongsByGenre: getSongsByGenreParameters,
         getStarred: getStarredParameters,
+        getTranscodeDecision: transcodeDecisionParameters,
+        getTranscodeStream: getTranscodeStreamParameters,
         randomSongList: randomSongListParameters,
         removeFavorite: removeFavoriteParameters,
         savePlayQueueByIndex: savePlayQueueByIndexParameters,
@@ -784,6 +863,7 @@ export const ssType = {
         getSong,
         getSongsByGenre,
         getStarred,
+        getTranscodeDecision,
         internetRadioStation,
         musicFolderList,
         ping,

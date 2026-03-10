@@ -908,6 +908,7 @@ export const NavidromeController: InternalControllerEndpoint = {
             totalRecordCount: res.totalRecordCount,
         };
     },
+    getTranscodeDecision: SubsonicController.getTranscodeDecision,
     getUserInfo: SubsonicController.getUserInfo,
     getUserList: async (args) => {
         const { apiClientProps, query } = args;
