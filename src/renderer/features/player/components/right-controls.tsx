@@ -1,9 +1,9 @@
 import { t } from 'i18next';
-import isElectron from 'is-electron';
-import { useCallback, useEffect, useMemo, useRef, useState, WheelEvent } from 'react';
+import { useCallback, useContext, useEffect, useMemo, useRef, useState, WheelEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { PopoverPlayQueue } from '/@/renderer/features/now-playing/components/popover-play-queue';
+import { DlnaClientContext } from '/@/renderer/features/player/api/dlna-client-provider';
 import { DlnaCastButton } from '/@/renderer/features/player/components/dlna-cast-button';
 import { PlayerConfig } from '/@/renderer/features/player/components/player-config';
 import { CustomPlayerbarSlider } from '/@/renderer/features/player/components/playerbar-slider';
@@ -63,10 +63,6 @@ import { useThrottledValue } from '/@/shared/hooks/use-throttled-value';
 import { LibraryItem, QueueSong, ServerType } from '/@/shared/types/domain-types';
 import { PlayerType } from '/@/shared/types/types';
 
-const dlnaPlayer = isElectron() ? window.api.dlnaPlayer : null;
-const ipc = isElectron() ? window.api.ipc : null;
-const dlnaPlayerListener = isElectron() ? window.api.dlnaPlayerListener : null;
-
 interface DlnaGroupMember {
     device: { id: string; isPair?: boolean; name: string };
     isCoordinator: boolean;
@@ -120,6 +116,7 @@ const SpeakerPropertiesPopover = ({
     triggerRect: DOMRect;
 }) => {
     const { t } = useTranslation();
+    const { client: dlnaPlayer, clientKey } = useContext(DlnaClientContext);
     const [speakerProps, setSpeakerProps] = useState<null | SpeakerProperties>(null);
     const [loading, setLoading] = useState(true);
     const leftCenter = triggerRect.left + triggerRect.width / 2;
@@ -138,7 +135,7 @@ const SpeakerPropertiesPopover = ({
                 setLoading(false);
             })
             .catch(() => setLoading(false));
-    }, [deviceId]);
+    }, [deviceId, dlnaPlayer, clientKey]);
 
     useEffect(() => {
         const close = (e: MouseEvent) => {
@@ -155,7 +152,7 @@ const SpeakerPropertiesPopover = ({
     const set = <K extends keyof SpeakerProperties>(key: K, value: SpeakerProperties[K]) => {
         if (!speakerProps) return;
         setSpeakerProps({ ...speakerProps, [key]: value });
-        ipc?.send('dlna-set-speaker-property', { deviceId, property: key, value });
+        dlnaPlayer?.setSpeakerProperty(deviceId, key, value);
     };
     return (
         <div data-speaker-props-popover onClick={(e) => e.stopPropagation()}>
@@ -1003,6 +1000,14 @@ const VolumeButton = () => {
     const { decreaseVolume, increaseVolume, mediaToggleMute, setVolume } = usePlayer();
     const isMinWidth = useMediaQuery('(max-width: 480px)');
     const { t } = useTranslation();
+    const { client: dlnaPlayer, clientKey } = useContext(DlnaClientContext);
+    // Stable ref so callbacks (handleMuteToggle, handleMemberVolume, the
+    // group-mute loop in the mute-button onClick) always see the latest
+    // client. Without this they would capture `null` from the first render
+    // (before the WS handshake completes) and silently no-op — the same
+    // stale-closure bug that affected the cast button and main engine.
+    const dlnaPlayerRef = useRef(dlnaPlayer);
+    dlnaPlayerRef.current = dlnaPlayer;
 
     const playbackType = usePlaybackType();
     const playbackSettings = usePlaybackSettings();
@@ -1026,8 +1031,22 @@ const VolumeButton = () => {
         [playbackType, setSettings],
     );
 
-    const [sliderValue, setSliderValue] = useState(volume);
+    const [sliderValue, setSliderValueState] = useState(volume);
     const throttledVolume = useThrottledValue(sliderValue, 100);
+    // Tracks whether the latest sliderValue change originated from user
+    // input (drag/wheel/keyboard) vs. a store-driven sync effect. The
+    // throttled-volume effect below forwards sliderValue to the store
+    // via `setVolume`, which in DLNA mode forwards as an RPC to the
+    // server. Without this flag, the sync effect that mirrors the store
+    // volume into the slider (e.g. when `onHello` applies a session
+    // snapshot) would trip the throttle, lag ~100 ms, then echo back a
+    // spurious `setVolume` RPC after the `applyingRemoteUpdate` guard
+    // clears — interrupting audio on the speaker.
+    const sliderFromUserRef = useRef(false);
+    const setSliderValue = useCallback((value: number) => {
+        sliderFromUserRef.current = true;
+        setSliderValueState(value);
+    }, []);
 
     // Sync throttled value to actual volume
     const [groupMembers, setGroupMembers] = useState<DlnaGroupMember[]>([]);
@@ -1066,8 +1085,8 @@ const VolumeButton = () => {
     }, []);
 
     useEffect(() => {
-        if (!dlnaPlayerListener) return;
-        const handleGroupState = (_: unknown, state: DlnaGroupMember[]) => {
+        if (!dlnaPlayer) return;
+        const handleGroupState = (state: DlnaGroupMember[]) => {
             groupMembersRef.current = state;
             setGroupMembers(state);
             setMemberMutes((prev) => {
@@ -1076,7 +1095,7 @@ const VolumeButton = () => {
                 return next;
             });
         };
-        const handleMemberVolume = (_: unknown, payload: { deviceId: string; volume: number }) => {
+        const handleMemberVolume = (payload: { deviceId: string; volume: number }) => {
             setGroupMembers((prev) => {
                 const next = prev.map((m) =>
                     m.device.id === payload.deviceId ? { ...m, volume: payload.volume } : m,
@@ -1085,13 +1104,16 @@ const VolumeButton = () => {
                 return next;
             });
         };
-        dlnaPlayerListener.rendererDlnaGroupState(handleGroupState);
-        dlnaPlayerListener.rendererDlnaGroupMemberVolume(handleMemberVolume);
+        const unsubGroupState = dlnaPlayer.on('rendererDlnaGroupState', handleGroupState);
+        const unsubMemberVolume = dlnaPlayer.on(
+            'rendererDlnaGroupMemberVolume',
+            handleMemberVolume,
+        );
         return () => {
-            ipc?.removeAllListeners('renderer-dlna-group-state');
-            ipc?.removeAllListeners('renderer-dlna-group-member-volume');
+            unsubGroupState();
+            unsubMemberVolume();
         };
-    }, []);
+    }, [dlnaPlayer, clientKey]);
 
     useEffect(() => {
         setGroupMembers((prev) => {
@@ -1103,21 +1125,36 @@ const VolumeButton = () => {
     }, [volume]);
 
     useEffect(() => {
+        // Skip when the throttled slider value matches the store volume —
+        // this means the slider was synced from a store/remote update
+        // (e.g. a DLNA session snapshot applied on tab open), not from
+        // user input.  Echoing it back would forward a redundant
+        // setVolume RPC to the DLNA server, which can cause a brief
+        // audio stutter on some devices.
+        if (throttledVolume === volume) return;
+        // Only forward to the store when the slider change came from
+        // user input. Store-driven syncs (the `setSliderValue(volume)`
+        // mirror effect below) set this ref to false; user input
+        // (drag/wheel/keyboard) sets it to true via the wrapper.
+        if (!sliderFromUserRef.current) return;
         setVolume(throttledVolume);
-    }, [throttledVolume, setVolume]);
+    }, [throttledVolume, setVolume, volume]);
 
-    // Sync external volume changes to local state
+    // Sync external volume changes to local state. Mark the slider
+    // value as non-user-originated so the throttled-volume effect above
+    // doesn't echo it back to the store as an RPC.
     useEffect(() => {
-        setSliderValue(volume);
+        sliderFromUserRef.current = false;
+        setSliderValueState(volume);
     }, [volume]);
 
     const handleMuteToggle = useCallback((deviceId: string, newMuted: boolean) => {
         setMemberMutes((prev) => ({ ...prev, [deviceId]: newMuted }));
-        ipc?.send('dlna-group-member-mute', { deviceId, muted: newMuted });
+        dlnaPlayerRef.current?.setGroupMemberMute(deviceId, newMuted);
     }, []);
 
     const handleMemberVolume = useCallback((deviceId: string, val: number) => {
-        dlnaPlayer?.setGroupMemberVolume(deviceId, val);
+        dlnaPlayerRef.current?.setGroupMemberVolume(deviceId, val);
         setGroupMembers((prev) => {
             const next = prev.map((m) => (m.device.id === deviceId ? { ...m, volume: val } : m));
             groupMembersRef.current = next;
@@ -1151,7 +1188,7 @@ const VolumeButton = () => {
             if (showGroupVolumePanel && !isShiftDown) applyVolumeToGroup(e);
             setSliderValue(e);
         },
-        [showGroupVolumePanel, isShiftDown, applyVolumeToGroup],
+        [showGroupVolumePanel, isShiftDown, applyVolumeToGroup, setSliderValue],
     );
 
     const handleVolumeWheel = useCallback(
@@ -1172,6 +1209,7 @@ const VolumeButton = () => {
             showGroupVolumePanel,
             isShiftDown,
             applyVolumeToGroup,
+            setSliderValue,
         ],
     );
 
@@ -1341,10 +1379,10 @@ const VolumeButton = () => {
                                             groupMembersRef.current.forEach((m) => {
                                                 if (!m.isCoordinator) {
                                                     newMutes[m.device.id] = newMuteState;
-                                                    ipc?.send('dlna-group-member-mute', {
-                                                        deviceId: m.device.id,
-                                                        muted: newMuteState,
-                                                    });
+                                                    dlnaPlayerRef.current?.setGroupMemberMute(
+                                                        m.device.id,
+                                                        newMuteState,
+                                                    );
                                                 }
                                             });
                                             setMemberMutes((prev) => ({ ...prev, ...newMutes }));

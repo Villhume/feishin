@@ -1,32 +1,39 @@
-import { net } from 'electron';
+import type { DlnaDevice, TrackMetadata } from '/@/shared/types/dlna';
 
-import log from '/@/main/logger';
+/**
+ * UPnP/SOAP client for DLNA MediaRenderers.
+ *
+ * Extracted from src/main/features/core/dlna/soap-client.ts so the same
+ * code serves both the Electron main process and the standalone casting
+ * server. The Electron-specific `log` import was replaced with an
+ * injectable logger so this module has no Electron dependency.
+ *
+ * The `setSoapLogger()` call below is invoked once at startup by the
+ * controller factory (in both Electron and standalone environments).
+ */
+import http from 'http';
+import https from 'https';
 
-const playerLog = (action: string, err?: unknown) => {
-    const message = `[Player] ${action}`;
-    log.info(message, err);
+export type { DlnaDevice, TrackMetadata };
+
+type LoggerFn = (action: string, err?: unknown) => void;
+
+let loggerFn: LoggerFn = (action, err) => {
+    if (err) {
+        console.error(`[Player] ${action}`, err);
+    } else {
+        console.log(`[Player] ${action}`);
+    }
 };
 
-export interface DlnaDevice {
-    controlUrl: string;
-    groupCoordinatorId?: string;
-    groupMembers?: DlnaDevice[];
-    id: string;
-    isPair?: boolean;
-    location: string;
-    name: string;
-    renderingControlUrl: string;
+/** Called once by createController() to replace the default console logger. */
+export function setSoapLogger(fn: LoggerFn): void {
+    loggerFn = fn;
 }
 
-export interface TrackMetadata {
-    albumArtUrl?: string;
-    albumName?: string;
-    artistName?: string;
-    autoPlay?: boolean;
-    duration?: number;
-    mimeType?: string;
-    title: string;
-}
+const playerLog = (action: string, err?: unknown) => {
+    loggerFn(`[Player] ${action}`, err);
+};
 
 function formatDuration(seconds: number): string {
     const h = Math.floor(seconds / 3600);
@@ -454,31 +461,59 @@ async function soapRequest(
     </s:Body>
 </s:Envelope>`;
     return new Promise((resolve, reject) => {
-        const request = net.request({
-            method: 'POST',
-            url: url,
-        });
-        request.setHeader('Content-Type', 'text/xml; charset="utf-8"');
-        request.setHeader('SOAPAction', `"${service}#${action}"`);
-        request.on('response', (response) => {
-            let data = '';
-            response.on('data', (chunk) => {
-                data += chunk.toString();
-            });
-            response.on('end', () => {
-                if (response.statusCode === 200) {
-                    resolve(data);
-                } else {
-                    reject(
-                        new Error(
-                            `SOAP Request failed with status ${response.statusCode}: ${data}`,
-                        ),
-                    );
-                }
-            });
-        });
+        const parsedUrl = new URL(url);
+        const lib = parsedUrl.protocol === 'https:' ? https : http;
+        const bodyBuffer = Buffer.from(soapBody, 'utf8');
+        const request = lib.request(
+            {
+                headers: {
+                    'Content-Length': bodyBuffer.length,
+                    'Content-Type': 'text/xml; charset="utf-8"',
+                    // Sonos (and some other DLNA renderers) don't handle
+                    // chunked transfer-encoding on SOAP POSTs. Without
+                    // an explicit Content-Length, Node sends the body with
+                    // Transfer-Encoding: chunked, which Sonos never sees
+                    // the end of — causing every SOAP request to hang
+                    // until the 8s timeout. Connection: close ensures the
+                    // response isn't held open by keep-alive either.
+                    Connection: 'close',
+                    SOAPAction: `"${service}#${action}"`,
+                },
+                host: parsedUrl.hostname,
+                method: 'POST',
+                path: parsedUrl.pathname + parsedUrl.search,
+                port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
+            },
+            (response) => {
+                let data = '';
+                response.on('data', (chunk) => {
+                    data += chunk.toString();
+                });
+                response.on('end', () => {
+                    if (response.statusCode === 200) {
+                        resolve(data);
+                    } else {
+                        reject(
+                            new Error(
+                                `SOAP Request failed with status ${response.statusCode}: ${data}`,
+                            ),
+                        );
+                    }
+                });
+            },
+        );
         request.on('error', reject);
-        request.write(soapBody);
+        // 8s timeout. Sonos normally responds to SOAP requests within
+        // 200-500ms. If a device goes non-responsive (e.g., mid-reboot,
+        // or stalling during group topology changes), requests would
+        // otherwise hang indefinitely — blocking connect(), position
+        // polling, and every other SOAP-dependent flow. 8s is generous
+        // enough for slow networks but prevents the "Connecting..."
+        // spinner from hanging forever.
+        request.setTimeout(8000, () => {
+            request.destroy(new Error(`SOAP ${action} timed out (8s)`));
+        });
+        request.write(bodyBuffer);
         request.end();
     });
 }

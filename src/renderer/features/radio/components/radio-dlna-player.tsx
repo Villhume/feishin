@@ -1,14 +1,17 @@
-import isElectron from 'is-electron';
-import { useEffect, useRef } from 'react';
+import { useContext, useEffect, useRef } from 'react';
 
+import { DlnaClientContext } from '/@/renderer/features/player/api/dlna-client-provider';
 import { useRadioPlayer, useRadioStore } from '/@/renderer/features/radio/hooks/use-radio-player';
 import { usePlayerActions, usePlayerMuted, usePlayerVolume } from '/@/renderer/store';
 
-const dlnaPlayer = isElectron() ? window.api.dlnaPlayer : null;
-const ipc = isElectron() ? window.api.ipc : null;
-const dlnaPlayerListener = isElectron() ? window.api.dlnaPlayerListener : null;
-
 export function RadioDlnaPlayer() {
+    const { client: dlnaPlayer, clientKey } = useContext(DlnaClientContext);
+    // Stable ref so the playUrl/volume/mute effects below always see the
+    // latest client. Without this they would capture `null` from the first
+    // render (before the WS handshake completes) and silently no-op — the
+    // same stale-closure bug that affected the cast button and main engine.
+    const dlnaPlayerRef = useRef(dlnaPlayer);
+    dlnaPlayerRef.current = dlnaPlayer;
     const { currentStreamUrl, stationName } = useRadioPlayer();
     const { setVolume } = usePlayerActions();
     const isMuted = usePlayerMuted();
@@ -21,27 +24,21 @@ export function RadioDlnaPlayer() {
             dlnaPlayer?.stop();
             lastUrlRef.current = null;
         };
-    }, []);
+    }, [dlnaPlayer, clientKey]);
     useEffect(() => {
-        if (!dlnaPlayerListener) return;
-        const handler = (_event: any, vol: number) => setVolume(vol);
-        dlnaPlayerListener.rendererDlnaVolume(handler);
-        return () => {
-            ipc?.removeAllListeners('renderer-dlna-volume');
-        };
-    }, [setVolume]);
+        if (!dlnaPlayer) return;
+        const handler = (vol: number) => setVolume(vol);
+        return dlnaPlayer.on('rendererDlnaVolume', handler);
+    }, [setVolume, dlnaPlayer, clientKey]);
     useEffect(() => {
-        if (!dlnaPlayerListener) return;
-        const handler = (_event: any, state: string) => {
+        if (!dlnaPlayer) return;
+        const handler = (state: string) => {
             if (state === 'STOPPED' || state === 'PAUSED_PLAYBACK') {
                 useRadioStore.getState().actions.stop();
             }
         };
-        dlnaPlayerListener.rendererDlnaTransportState(handler);
-        return () => {
-            ipc?.removeAllListeners('renderer-dlna-transport-state');
-        };
-    }, []);
+        return dlnaPlayer.on('rendererDlnaTransportState', handler);
+    }, [dlnaPlayer, clientKey]);
     const { isPlaying } = useRadioPlayer();
     const isInitialMountRef = useRef(true);
     useEffect(() => {
@@ -50,22 +47,22 @@ export function RadioDlnaPlayer() {
             return;
         }
         if (!isPlaying) {
-            dlnaPlayer?.stop();
+            dlnaPlayerRef.current?.stop();
             useRadioStore.getState().actions.stop();
         }
     }, [isPlaying]);
     useEffect(() => {
-        if (!dlnaPlayer || !currentStreamUrl) return;
+        const client = dlnaPlayerRef.current;
+        if (!client || !currentStreamUrl) return;
         if (currentStreamUrl === lastUrlRef.current) return;
         lastUrlRef.current = currentStreamUrl;
-        dlnaPlayer.playUrl(currentStreamUrl, { title: stationName || 'Radio' });
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [currentStreamUrl]);
+        client.playUrl(currentStreamUrl, { title: stationName || 'Radio' });
+    }, [currentStreamUrl, stationName]);
     useEffect(() => {
-        dlnaPlayer?.volume(volume);
+        dlnaPlayerRef.current?.volume(volume);
     }, [volume]);
     useEffect(() => {
-        dlnaPlayer?.mute(isMuted);
+        dlnaPlayerRef.current?.mute(isMuted);
     }, [isMuted]);
     return <div id="radio-dlna-player" style={{ display: 'none' }} />;
 }

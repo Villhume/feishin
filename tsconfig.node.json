@@ -2,10 +2,12 @@
   "extends": "@electron-toolkit/tsconfig/tsconfig.node.json",
   "include": [
     "electron.vite.config.*",
+    "server.vite.config.*",
     "vite.kuromoji-plugin.ts",
     "vite.react-plugin.ts",
     "src/main/**/*",
     "src/preload/**/*",
+    "src/server/**/*",
     "src/i18n/**/*",
     "src/types/**/*",
     "src/shared/**/*"
@@ -21,6 +23,9 @@
       ],
       "/@/preload/*": [
         "src/preload/*"
+      ],
+      "/@/server/*": [
+        "src/server/*"
       ],
       "/@/shared/*": [
         "src/shared/*"

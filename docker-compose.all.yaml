@@ -1,0 +1,62 @@
+# Combined compose file: Feishin web app + standalone casting server.
+#
+# Run with:  docker compose -f docker-compose.all.yaml up --build
+#
+# - Feishin web app (nginx)         → http://localhost:9180
+# - Casting server (Node + ffmpeg)  → ws://localhost:8180
+#
+# The web app's auto-discovery probes `ws://<hostname>:8180` on load, so
+# when both run on the same Docker host the cast button should "just work"
+# in `auto` mode (the default in Settings → Playback → Cast).
+#
+# The casting server uses bridge networking here (cross-platform). For
+# Sonos group/discovery features, switch it to host networking — see the
+# notes in docker-compose.casting.yaml (Linux only).
+
+services:
+    feishin:
+        container_name: feishin
+        image: ghcr.io/jeffvli/feishin:latest
+        build:
+            context: .
+            dockerfile: Dockerfile.prebuilt
+        restart: unless-stopped
+        ports:
+            - 9180:9180
+            - 4533:4533
+        environment:
+            # Pre-defined music server. Change type/url/name to match yours.
+            # Allowed types: jellyfin, navidrome, subsonic (case-insensitive).
+            - SERVER_NAME=jellyfin
+            - SERVER_TYPE=jellyfin
+            - SERVER_URL=http://host.docker.internal:8096
+            # When true AND name/type/url are set, only username/password can be toggled.
+            - SERVER_LOCK=false
+            - LEGACY_AUTHENTICATION=false
+            - ANALYTICS_DISABLED=false
+        depends_on:
+            - feishin-casting
+
+    feishin-casting:
+        container_name: feishin-casting
+        image: ghcr.io/jeffvli/feishin-casting:latest
+        build:
+            context: .
+            dockerfile: Dockerfile.casting
+        restart: unless-stopped
+        ports:
+            - 8180:8180
+        environment:
+            - PORT=8180
+            # Optional bearer token. If set, browsers must send it via the
+            # `?token=` query param on the WS URL. Leave empty for no auth.
+            - AUTH_TOKEN=
+            # In bridge mode set this to the Docker host's LAN IP so DLNA
+            # devices can reach the event server. Leave empty in host mode.
+            - OVERRIDE_LAN_IP=192.168.0.33
+            # In bridge mode set to `true` — UPnP event subscription will
+            # silently fail because devices can't reach the container.
+            # The server falls back to position/state polling.
+            - DISABLE_EVENT_SUBSCRIPTION=true
+            # Optional path to ffmpeg. Defaults to `ffmpeg` on PATH.
+            - FFMPEG_PATH=

@@ -1,11 +1,11 @@
 import type { RefObject } from 'react';
 
-import isElectron from 'is-electron';
-import { useCallback, useEffect, useImperativeHandle, useRef } from 'react';
+import { useCallback, useContext, useEffect, useImperativeHandle, useRef } from 'react';
 
 import { playerHandoff } from './player-handoff';
 
 import { api } from '/@/renderer/api';
+import { DlnaClientContext } from '/@/renderer/features/player/api/dlna-client-provider';
 import { usePlayerEvents } from '/@/renderer/features/player/audio-player/hooks/use-player-events';
 import { getSongUrl } from '/@/renderer/features/player/audio-player/hooks/use-stream-url';
 import { AudioPlayer } from '/@/renderer/features/player/audio-player/types';
@@ -16,12 +16,18 @@ import {
     usePlayerStore,
     useSettingsStore,
 } from '/@/renderer/store';
+import { usePlayerStoreBase } from '/@/renderer/store/player.store';
 import { LibraryItem, QueueSong } from '/@/shared/types/domain-types';
 import { PlayerStatus } from '/@/shared/types/types';
 
 export interface DlnaPlayerEngineHandle extends AudioPlayer {}
 
 export const pendingInitialSeek = { value: -1 };
+
+export type SongWithAudioMeta = {
+    contentType?: null | string;
+    suffix?: null | string;
+};
 
 interface DlnaPlayerEngineProps {
     isMuted: boolean;
@@ -30,15 +36,6 @@ interface DlnaPlayerEngineProps {
     playerStatus: PlayerStatus;
     volume: number;
 }
-
-type SongWithAudioMeta = {
-    contentType?: null | string;
-    suffix?: null | string;
-};
-
-const dlnaPlayer = isElectron() ? window.api.dlnaPlayer : null;
-const dlnaPlayerListener = isElectron() ? window.api.dlnaPlayerListener : null;
-const ipc = isElectron() ? window.api.ipc : null;
 const SUFFIX_MIME_MAP: Record<string, string> = {
     aac: 'audio/aac',
     flac: 'audio/flac',
@@ -59,6 +56,52 @@ const FORMAT_MIME_MAP: Record<string, string> = {
     opus: 'audio/ogg; codecs=opus',
     raw: '',
 };
+
+export async function getDlnaUrl(
+    song: QueueSong,
+    transcode: TranscodingConfig,
+): Promise<string | undefined> {
+    const { contentType, suffix } = song as unknown as SongWithAudioMeta;
+    if (isOpusByMetadata({ contentType, suffix })) {
+        const mp3Url = await getSongUrl(song, { ...transcode, enabled: true, format: 'mp3' });
+        return mp3Url;
+    }
+    // Detection falls back to a probe of the actual stream if there isn't a positive from the initial metadata/suffix test
+    const probeUrl = await getSongUrl(song, { ...transcode, enabled: false }, true);
+    if (probeUrl) {
+        const isOpus = await probeIsOpusOgg(probeUrl);
+        if (isOpus) {
+            const mp3Url = await getSongUrl(song, { ...transcode, enabled: true, format: 'mp3' });
+            return mp3Url ?? probeUrl;
+        }
+        if (isOggByMetadata({ contentType, suffix })) {
+            const mp3Url = await getSongUrl(song, { ...transcode, enabled: true, format: 'mp3' });
+            return mp3Url ?? probeUrl;
+        }
+    }
+    const playbackUrl = await getSongUrl(song, transcode);
+    return playbackUrl;
+}
+
+export async function resolveMimeType(
+    url: string,
+    contentType?: null | string,
+    suffix?: null | string,
+): Promise<string> {
+    const fromMetadata = getMimeType(url, contentType, suffix);
+    if (fromMetadata !== 'audio/mpeg') return fromMetadata;
+    try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 1000);
+        const res = await fetch(url, { method: 'HEAD', signal: controller.signal });
+        clearTimeout(timeoutId);
+        const ct = res.headers.get('content-type');
+        if (ct?.startsWith('audio/')) return ct.split(';')[0].trim();
+    } catch {
+        // Handle
+    }
+    return 'audio/mpeg';
+}
 
 function extractDlnaId(url: string): string {
     try {
@@ -103,32 +146,6 @@ async function findQueueMatchForUris(
         return { index: i, matchedSong: items[i], matchedUrl: url };
     }
     return null;
-}
-
-async function getDlnaUrl(
-    song: QueueSong,
-    transcode: TranscodingConfig,
-): Promise<string | undefined> {
-    const { contentType, suffix } = song as unknown as SongWithAudioMeta;
-    if (isOpusByMetadata({ contentType, suffix })) {
-        const mp3Url = await getSongUrl(song, { ...transcode, enabled: true, format: 'mp3' });
-        return mp3Url;
-    }
-    // Detection falls back to a probe of the actual stream if there isn't a positive from the initial metadata/suffix test
-    const probeUrl = await getSongUrl(song, { ...transcode, enabled: false }, true);
-    if (probeUrl) {
-        const isOpus = await probeIsOpusOgg(probeUrl);
-        if (isOpus) {
-            const mp3Url = await getSongUrl(song, { ...transcode, enabled: true, format: 'mp3' });
-            return mp3Url ?? probeUrl;
-        }
-        if (isOggByMetadata({ contentType, suffix })) {
-            const mp3Url = await getSongUrl(song, { ...transcode, enabled: true, format: 'mp3' });
-            return mp3Url ?? probeUrl;
-        }
-    }
-    const playbackUrl = await getSongUrl(song, transcode);
-    return playbackUrl;
 }
 
 function getMimeType(url: string, contentType?: null | string, suffix?: null | string): string {
@@ -211,26 +228,6 @@ async function probeIsOpusOgg(url: string): Promise<boolean> {
     }
 }
 
-async function resolveMimeType(
-    url: string,
-    contentType?: null | string,
-    suffix?: null | string,
-): Promise<string> {
-    const fromMetadata = getMimeType(url, contentType, suffix);
-    if (fromMetadata !== 'audio/mpeg') return fromMetadata;
-    try {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 1000);
-        const res = await fetch(url, { method: 'HEAD', signal: controller.signal });
-        clearTimeout(timeoutId);
-        const ct = res.headers.get('content-type');
-        if (ct?.startsWith('audio/')) return ct.split(';')[0].trim();
-    } catch {
-        // Handle
-    }
-    return 'audio/mpeg';
-}
-
 function urisMatch(a: string, b: string): boolean {
     if (!a || !b) return false;
     const aId = extractDlnaId(a);
@@ -247,8 +244,24 @@ function urisMatch(a: string, b: string): boolean {
 
 export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
     const { isMuted, onEnded, playerRef, playerStatus, volume } = props;
+    // Source of truth for the DLNA backend: in Electron this wraps
+    // window.api.dlnaPlayer (IPC); in web/Docker it wraps a WsDlnaClient
+    // connected to a standalone casting server. Both expose the same
+    // DlnaClient interface. The `clientKey` is used as an effect dependency
+    // so subscriptions are re-registered after a client swap.
+    const { client: dlnaPlayer, clientKey } = useContext(DlnaClientContext);
+    // Stable ref to the current DLNA client. The memoized callbacks and
+    // effects below (sendCurrentTrackToDlna, playerStatus effect, volume/mute
+    // effects, usePlayerEvents) read from this ref instead of the
+    // `dlnaPlayer` variable so they always see the latest client without
+    // needing it in their dependency arrays. Without this, the callbacks
+    // capture `null` on first render (before the WS handshake completes) and
+    // silently no-op every subsequent call — the stale-closure bug that
+    // prevented playback from working in the web/Docker path.
+    const dlnaPlayerRef = useRef(dlnaPlayer);
+    dlnaPlayerRef.current = dlnaPlayer;
     const { transcode } = usePlaybackSettings();
-    const { mediaPause, mediaPlay, mediaPlayByIndex, mediaPrevious, setTimestamp, setVolume } =
+    const { mediaPause, mediaPlay, mediaPlayByIndex, mediaPrevious, setTimestamp } =
         usePlayerActions();
     const hasPlayedRef = useRef(false);
     const skipNextSendRef = useRef(false);
@@ -281,7 +294,15 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
         return () => unsubscribe();
     }, []);
     const sendCurrentTrackToDlna = useCallback(async () => {
-        if (!dlnaPlayer) return;
+        const client = dlnaPlayerRef.current;
+        if (!client) return;
+        // Server-authoritative session: the server owns the queue and
+        // issues its own `playUrl` via `sendCurrentTrackFromSession()`.
+        // The renderer is just a mirror — sending `playUrl` from here
+        // would race with the server's call and double-load the track.
+        if (usePlayerStore.getState().isDlnaMode) {
+            return;
+        }
         const generation = ++sendCurrentTrackGenRef.current;
         const wasPlayingAtStart = usePlayerStore.getState().player.status === PlayerStatus.PLAYING;
         const wasAutoAdvancingAtStart = isAutoAdvancingRef.current;
@@ -294,7 +315,7 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
         let urlToPlay = rawUrl;
         let isProxy = false;
         if (currentSpeed !== 1) {
-            await dlnaPlayer.prepareSpeedFile({
+            await client.prepareSpeedFile({
                 offset: 0,
                 preservePitch: preservePitchRef.current,
                 speed: currentSpeed,
@@ -308,7 +329,7 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
                 await new Promise<void>((r) => setTimeout(r, 300));
                 if (generation !== sendCurrentTrackGenRef.current) return;
                 if (usePlayerStore.getState().getPlayerData().currentSong?.id !== songId) return;
-                readyUrl = await dlnaPlayer.checkSpeedFile({
+                readyUrl = await client.checkSpeedFile({
                     preservePitch: preservePitchRef.current,
                     speed: currentSpeed,
                     url: rawUrl,
@@ -318,7 +339,7 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
             urlToPlay = readyUrl;
             isProxy = true;
         } else {
-            dlnaPlayer.destroySpeedProxy?.();
+            client.destroySpeedProxy?.();
         }
         if (skipNextSendRef.current) {
             skipNextSendRef.current = false;
@@ -373,7 +394,7 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
             pendingInitialSeek.value = -1;
         }
         justLoadedTrackRef.current = true;
-        dlnaPlayer.playUrl(
+        client.playUrl(
             urlToPlay,
             {
                 albumArtUrl,
@@ -417,7 +438,7 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
                         nextContentType,
                         nextSuffix,
                     );
-                    dlnaPlayer.setNextUrl(nextUrl, {
+                    dlnaPlayerRef.current?.setNextUrl(nextUrl, {
                         albumArtUrl: nextArtUrl,
                         albumName: nextSong.album || undefined,
                         artistName: nextSong.artistName || nextSong.artists?.[0]?.name || undefined,
@@ -431,13 +452,17 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
             } else {
                 sameUriLoopQueuedRef.current = false;
                 setTimeout(() => {
-                    dlnaPlayer?.clearNextUrl();
+                    dlnaPlayerRef.current?.clearNextUrl();
                 }, 2000);
             }
         }, 1000);
     }, [transcode, props.isMuted]);
     const sendNextTrackDebounceRef = useRef<null | ReturnType<typeof setTimeout>>(null);
     const sendNextTrackToDlna = useCallback(() => {
+        // Server-authoritative session: the server preloads the next track
+        // via `preloadNextTrackFromSession()`. Skip the renderer-side
+        // `setNextUrl` call entirely to avoid racing the server's call.
+        if (usePlayerStore.getState().isDlnaMode) return;
         if (sendNextTrackDebounceRef.current !== null) {
             clearTimeout(sendNextTrackDebounceRef.current);
         }
@@ -445,13 +470,14 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
         const debounceMs = msSinceRepeatChange < 2000 ? 2000 - msSinceRepeatChange + 100 : 80;
         sendNextTrackDebounceRef.current = setTimeout(async () => {
             sendNextTrackDebounceRef.current = null;
-            if (!dlnaPlayer) return;
+            const client = dlnaPlayerRef.current;
+            if (!client) return;
             const currentSpeed = usePlayerStore.getState().player.speed || 1;
             if (currentSpeed !== 1) return;
             const playerData = usePlayerStore.getState().getPlayerData();
             const nextSong = playerData.nextSong;
             if (!nextSong) {
-                dlnaPlayer.clearNextUrl();
+                client.clearNextUrl();
                 return;
             }
             const { contentType: nextContentType, suffix: nextSuffix } =
@@ -474,7 +500,7 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
                 // Ignore image URL errors
             }
             const mimeType = await resolveMimeType(nextUrl, nextContentType, nextSuffix);
-            dlnaPlayer.setNextUrl(nextUrl, {
+            client.setNextUrl(nextUrl, {
                 albumArtUrl: nextArtUrl,
                 albumName: nextSong.album || undefined,
                 artistName: nextSong.artistName || nextSong.artists?.[0]?.name || undefined,
@@ -487,9 +513,73 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
 
     useEffect(() => {
         if (playerHandoff.deviceAlreadyPlaying) {
+            // The server emits `rendererDlnaConnectPlayback` *before* the
+            // connect RPC result returns, so the event listener in the
+            // effect below isn't registered yet and the event is dropped.
+            // We reconstruct the event handler's logic here using the
+            // ConnectResult data passed through playerHandoff.
+            const transportState = playerHandoff.deviceTransportState;
+            const deviceUri = playerHandoff.deviceCurrentUri;
+            const deviceNextUri = playerHandoff.deviceNextUri;
+            const devicePosition = playerHandoff.devicePosition;
             playerHandoff.deviceAlreadyPlaying = false;
             playerHandoff.deviceWasPaused = false;
+            playerHandoff.deviceTransportState = '';
+            playerHandoff.deviceCurrentUri = '';
+            playerHandoff.deviceNextUri = '';
+            playerHandoff.devicePosition = 0;
             mountHandoffInProgressRef.current = true;
+            hasPlayedRef.current = true;
+            devicePassiveModeRef.current = false;
+            // Replicate the rendererDlnaConnectPlayback event handler:
+            // match the device's URI to a queue entry, select it, set
+            // position, then play/pause.  This is async because
+            // findQueueMatchForUris and getDlnaUrl do IPC/RPC calls.
+            (async () => {
+                const match = deviceUri
+                    ? await findQueueMatchForUris(deviceUri, deviceNextUri)
+                    : null;
+                if (match) {
+                    const playerData = usePlayerStore.getState().getPlayerData();
+                    const isAlreadyCurrent =
+                        playerData.currentSong?._uniqueId === match.matchedSong._uniqueId;
+                    let trackedUrl = match.matchedUrl;
+                    try {
+                        const fullUrl = await getDlnaUrl(match.matchedSong, transcode);
+                        if (fullUrl) trackedUrl = fullUrl;
+                    } catch {
+                        // Fallback
+                    }
+                    if (!isAlreadyCurrent) {
+                        mediaPlayByIndex?.(match.index);
+                    }
+                    if (devicePosition > 0) setTimestamp(Math.floor(devicePosition));
+                    lastSentRawUrlRef.current = trackedUrl;
+                    lastSentUrlRef.current = trackedUrl;
+                    lastSentAtRef.current = Date.now();
+                    wasNearEndRef.current = false;
+                }
+                if (playerStatus === PlayerStatus.PLAYING) {
+                    if (pendingInitialSeek.value >= 0) {
+                        const seekTarget = pendingInitialSeek.value;
+                        pendingInitialSeek.value = -1;
+                        dlnaPlayerRef.current?.seek(seekTarget);
+                    }
+                    dlnaPlayerRef.current?.play();
+                } else if (transportState === 'PLAYING') {
+                    pendingInitialSeek.value = -1;
+                    speakerSidePlayRef.current = true;
+                    suppressDeviceSeekRef.current = true;
+                    mediaPlay?.();
+                } else if (
+                    transportState === 'PAUSED_PLAYBACK' &&
+                    usePlayerStore.getState().player.status !== PlayerStatus.PAUSED
+                ) {
+                    speakerSidePauseRef.current = true;
+                    mediaPause?.();
+                }
+                mountHandoffInProgressRef.current = false;
+            })();
             return;
         } else {
             if (playerStatus !== PlayerStatus.PLAYING) {
@@ -503,10 +593,10 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
         // Only run on mount
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
-    // Listen for position updates from main process
+    // Listen for position updates from main process / casting server
     useEffect(() => {
-        if (!dlnaPlayerListener) return;
-        const handleCurrentTime = (_event: any, time: number) => {
+        if (!dlnaPlayer) return;
+        const handleCurrentTime = (time: number) => {
             if (
                 !wasNearEndRef.current &&
                 currentSongDurationRef.current > 0 &&
@@ -516,24 +606,24 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
             }
             setTimestamp(Math.floor(time));
         };
-        dlnaPlayerListener.rendererCurrentTime(handleCurrentTime);
-        return () => {
-            ipc?.removeAllListeners('renderer-dlna-current-time');
-        };
-    }, [setTimestamp]);
+        return dlnaPlayer.on('rendererCurrentTime', handleCurrentTime);
+    }, [setTimestamp, dlnaPlayer, clientKey]);
     useEffect(() => {
-        if (!dlnaPlayerListener) return;
-        if (!ipc) return;
-        const handler = async (
-            _event: any,
-            info: {
-                duration: number;
-                nextUri: string;
-                position: number;
-                transportState: string;
-                uri: string;
-            },
-        ) => {
+        if (!dlnaPlayer) return;
+        const handler = async (info: {
+            duration: number;
+            nextUri: string;
+            position: number;
+            transportState: string;
+            uri: string;
+        }) => {
+            // Server-authoritative session: the server owns the queue, the
+            // URI→queue-index mapping, and the player state.  It pushes
+            // `rendererQueueState` / `rendererPlayerState` events directly,
+            // which `useDlnaSessionSync` applies to the store.  Replaying
+            // the legacy "match the device URI to a queue entry" flow here
+            // would race with the server's snapshot and double-select.
+            if (usePlayerStore.getState().isDlnaMode) return;
             mountHandoffInProgressRef.current = true;
             hasPlayedRef.current = true;
             devicePassiveModeRef.current = false;
@@ -592,10 +682,7 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
                 sendCurrentTrackToDlna();
             }
         };
-        dlnaPlayerListener.rendererDlnaConnectPlayback(handler);
-        return () => {
-            ipc?.removeAllListeners('renderer-dlna-connect-playback');
-        };
+        return dlnaPlayer.on('rendererDlnaConnectPlayback', handler);
     }, [
         transcode,
         setTimestamp,
@@ -605,11 +692,18 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
         mediaPlay,
         mediaPlayByIndex,
         mediaPause,
+        dlnaPlayer,
+        clientKey,
     ]);
     // Send just the next track (for after gapless transition)
     useEffect(() => {
-        if (!dlnaPlayerListener) return;
-        const handler = (_event: any, state: string) => {
+        if (!dlnaPlayer) return;
+        const handler = (state: string) => {
+            // Server-authoritative session: transport state pushes arrive
+            // via `rendererPlayerState` patches (the `status` field) and
+            // are applied by `useDlnaSessionSync`.  This legacy handler
+            // would call `mediaPlay`/`mediaPause` and loop.
+            if (usePlayerStore.getState().isDlnaMode) return;
             if (devicePassiveModeRef.current) {
                 if (state === 'PLAYING') {
                     devicePassiveModeRef.current = false;
@@ -630,15 +724,17 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
                 mediaPause?.();
             }
         };
-        dlnaPlayerListener.rendererDlnaTransportState(handler);
-        return () => {
-            ipc?.removeAllListeners('renderer-dlna-transport-state');
-        };
-    }, [mediaPlay, mediaPause]);
+        return dlnaPlayer.on('rendererDlnaTransportState', handler);
+    }, [mediaPlay, mediaPause, dlnaPlayer, clientKey]);
     useEffect(() => {
-        if (!dlnaPlayerListener) return;
-        if (!ipc) return;
+        if (!dlnaPlayer) return;
         const handler = () => {
+            // Server-authoritative session: prev-track is initiated by the
+            // server itself (it owns position polling + track-end detection).
+            // The renderer's `mediaPrevious` action also forwards via RPC
+            // when `isDlnaMode` is true.  This legacy event handler would
+            // double-advance.
+            if (usePlayerStore.getState().isDlnaMode) return;
             const timeSinceTrackEnded = Date.now() - recentTrackEndedAtRef.current;
             if (timeSinceTrackEnded < TRACK_ENDED_PREV_SUPPRESSION_MS) {
                 return;
@@ -658,26 +754,43 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
             sameUriLoopQueuedRef.current = false;
             mediaPrevious(false);
         };
-        dlnaPlayerListener.rendererDlnaPrevTrack(handler);
-        return () => {
-            ipc?.removeAllListeners('renderer-dlna-prev-track');
-        };
-    }, [mediaPrevious, onEnded, sendNextTrackToDlna]);
+        return dlnaPlayer.on('rendererDlnaPrevTrack', handler);
+    }, [mediaPrevious, onEnded, sendNextTrackToDlna, dlnaPlayer, clientKey]);
     useEffect(() => {
-        if (!dlnaPlayerListener) return;
-        const handler = (_event: any, vol: number) => {
-            setVolume?.(vol);
+        if (!dlnaPlayer) return;
+        const handler = (vol: number) => {
+            // Device-side volume events (Sonos app, physical knob, poll-detected
+            // drift) still arrive on this legacy channel even in
+            // server-authoritative mode. The `rendererPlayerState` patch path
+            // only fires when the volume change originated from a `setVolume`
+            // RPC — device-side changes aren't broadcast as patches, so without
+            // this handler the slider in secondary tabs would never move when
+            // the user turns the knob outside the app.
+            //
+            // Write directly to the store (bypassing the `setVolume` action)
+            // so we don't re-forward to the server via `sessionSetVolume` and
+            // create an echo loop. The engine's `volume` effect below still
+            // bails on `isDlnaMode`, so no redundant SOAP command is sent to
+            // the device either.
+            if (usePlayerStoreBase.getState().applyingRemoteUpdate) return;
+            usePlayerStoreBase.setState((s) => {
+                s.player.volume = vol;
+            });
         };
-        dlnaPlayerListener.rendererDlnaVolume(handler);
-        return () => {
-            ipc?.removeAllListeners('renderer-dlna-volume');
-        };
-    }, [setVolume]);
+        return dlnaPlayer.on('rendererDlnaVolume', handler);
+    }, [dlnaPlayer, clientKey]);
     // Listen for track ended events
     useEffect(() => {
-        if (!dlnaPlayerListener) return;
-        if (!ipc) return;
+        if (!dlnaPlayer) return;
         const handleTrackEnded = () => {
+            // Server-authoritative session: the server's
+            // `startPositionPolling` detects track-end and advances the
+            // queue itself (via `session.next()` →
+            // `sendCurrentTrackFromSession()`).  It still emits
+            // `rendererDlnaTrackEnded` for UI animation cues, but the
+            // renderer must NOT call `onEnded()` or `stop()` — the
+            // server owns the queue and the device transport.
+            if (usePlayerStore.getState().isDlnaMode) return;
             if (!hasPlayedRef.current) return;
             const state = usePlayerStore.getState();
             const playerData = state.getPlayerData();
@@ -686,7 +799,7 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
             if (isAtEnd && !isRepeating) {
                 isAutoAdvancingRef.current = false;
                 hasPlayedRef.current = false;
-                dlnaPlayer?.stop();
+                dlnaPlayer.stop();
                 onEnded();
                 return;
             }
@@ -705,11 +818,8 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
                 setTimeout(() => sendNextTrackToDlna(), 500);
             }
         };
-        dlnaPlayerListener.rendererDlnaTrackEnded(handleTrackEnded);
-        return () => {
-            ipc?.removeAllListeners('renderer-dlna-track-ended');
-        };
-    }, [onEnded, sendCurrentTrackToDlna, sendNextTrackToDlna]);
+        return dlnaPlayer.on('rendererDlnaTrackEnded', handleTrackEnded);
+    }, [onEnded, sendCurrentTrackToDlna, sendNextTrackToDlna, dlnaPlayer, clientKey]);
     // Handle play/pause
     const isInitialMount = useRef(true);
     useEffect(() => {
@@ -717,11 +827,18 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
             isInitialMount.current = false;
             return;
         }
-        if (!dlnaPlayer) return;
+        const client = dlnaPlayerRef.current;
+        if (!client) return;
+        // Server-authoritative session: play/pause forwards via the
+        // `sessionSetStatus` RPC (the store action intercepts).  The
+        // server issues `play()`/`pause()` to the device and broadcasts
+        // a `rendererPlayerState` patch back.  Calling `client.play()` /
+        // `sendCurrentTrackToDlna()` here would race with the server.
+        if (usePlayerStore.getState().isDlnaMode) return;
         if (devicePassiveModeRef.current) {
             if (playerStatus === PlayerStatus.PAUSED) {
                 devicePassiveModeRef.current = false;
-                dlnaPlayer.pause();
+                client.pause();
                 return;
             }
             if (playerStatus === PlayerStatus.PLAYING) {
@@ -748,7 +865,7 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
                         sendCurrentTrackToDlna();
                     } else if (!isSpeakerSidePlay) {
                         if (Date.now() - lastSentAtRef.current > 2000) {
-                            dlnaPlayer.play();
+                            client.play();
                         }
                     }
                 };
@@ -758,23 +875,39 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
             }
         } else if (playerStatus === PlayerStatus.PAUSED) {
             if (!isSpeakerSidePause) {
-                dlnaPlayer.pause();
+                client.pause();
             }
         }
     }, [playerStatus, transcode, sendCurrentTrackToDlna]);
     // Handle volume
     useEffect(() => {
-        if (!dlnaPlayer) return;
-        dlnaPlayer.volume(volume);
+        const client = dlnaPlayerRef.current;
+        if (!client) return;
+        // Server-authoritative session: volume changes forward via the
+        // `setVolume` RPC (the store action intercepts and forwards).
+        // Calling `client.volume()` here would race with the server's
+        // own volume push.
+        if (usePlayerStore.getState().isDlnaMode) return;
+        client.volume(volume);
     }, [volume]);
     // Handle mute
     useEffect(() => {
-        if (!dlnaPlayer) return;
-        dlnaPlayer.mute(isMuted);
+        const client = dlnaPlayerRef.current;
+        if (!client) return;
+        // Server-authoritative session: mute changes forward via the
+        // `setMuted` RPC.  Skip the direct `client.mute()` call to avoid
+        // racing the server's own mute push.
+        if (usePlayerStore.getState().isDlnaMode) return;
+        client.mute(isMuted);
     }, [isMuted]);
     usePlayerEvents(
         {
             onMediaNext: () => {
+                // Server-authoritative session: next/prev forward via
+                // the `sessionNext` RPC (the store action intercepts).
+                // Skip the legacy `sendCurrentTrackToDlna` flow — the
+                // server issues its own `playUrl`.
+                if (usePlayerStore.getState().isDlnaMode) return;
                 devicePassiveModeRef.current = false;
                 sameUriLoopQueuedRef.current = false;
                 wasNearEndRef.current = false;
@@ -782,6 +915,8 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
                 sendCurrentTrackToDlna();
             },
             onMediaPrev: () => {
+                // Server-authoritative session: see `onMediaNext` above.
+                if (usePlayerStore.getState().isDlnaMode) return;
                 devicePassiveModeRef.current = false;
                 sameUriLoopQueuedRef.current = false;
                 wasNearEndRef.current = false;
@@ -791,6 +926,8 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
             onPlayerPlay: () => {
                 if (mountHandoffInProgressRef.current) return;
                 if (devicePassiveModeRef.current) return;
+                // Server-authoritative session: see `onMediaNext` above.
+                if (usePlayerStore.getState().isDlnaMode) return;
                 if (justLoadedTrackRef.current) {
                     justLoadedTrackRef.current = false;
                     return;
@@ -803,11 +940,21 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
                     suppressDeviceSeekRef.current = false;
                     return;
                 }
-                dlnaPlayer?.seek(properties.timestamp);
+                // Server-authoritative session: seek forwards via the
+                // `seek` RPC; the server issues the SOAP `Seek` to the
+                // device and broadcasts a `rendererPlayerState` patch
+                // back. Calling `.seek()` here would double-seek.
+                if (usePlayerStore.getState().isDlnaMode) return;
+                dlnaPlayerRef.current?.seek(properties.timestamp);
             },
             onQueueCleared: () => {
+                // Server-authoritative session: the server owns the queue
+                // and clears it via the `queueClear` RPC (the store
+                // action intercepts and forwards).  Calling `stop()` here
+                // would race with the server's own `stop` on disconnect.
+                if (usePlayerStore.getState().isDlnaMode) return;
                 devicePassiveModeRef.current = false;
-                dlnaPlayer?.stop();
+                dlnaPlayerRef.current?.stop();
                 hasPlayedRef.current = false;
                 lastSentUrlRef.current = '';
                 lastSentRawUrlRef.current = '';
@@ -815,6 +962,11 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
                 wasNearEndRef.current = false;
             },
             onQueueRestored: () => {
+                // Server-authoritative session: the server owns the queue
+                // and will issue its own `playUrl` via
+                // `sendCurrentTrackFromSession()` when its queue becomes
+                // non-empty.
+                if (usePlayerStore.getState().isDlnaMode) return;
                 devicePassiveModeRef.current = false;
                 sendCurrentTrackToDlna();
             },
@@ -825,7 +977,11 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
         return usePlayerStore.subscribe(
             (state) => state.player.repeat,
             () => {
-                if (!hasPlayedRef.current || !dlnaPlayer) return;
+                // Server-authoritative session: the server owns the next-track
+                // preload and re-evaluates it when its own repeat state
+                // changes (via `sessionSetRepeat` → `preloadNextTrack`).
+                if (usePlayerStore.getState().isDlnaMode) return;
+                if (!hasPlayedRef.current || !dlnaPlayerRef.current) return;
                 repeatChangedAtRef.current = Date.now();
                 sendNextTrackToDlna();
             },
@@ -835,7 +991,10 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
         return usePlayerStore.subscribe(
             (state) => state.getPlayerData().nextSong?.id ?? null,
             (nextId, prevId) => {
-                if (!hasPlayedRef.current || !dlnaPlayer) return;
+                // Server-authoritative session: the server preloads the
+                // next track itself when its queue/index changes.
+                if (usePlayerStore.getState().isDlnaMode) return;
+                if (!hasPlayedRef.current || !dlnaPlayerRef.current) return;
                 if (nextId === prevId) return;
                 sendNextTrackToDlna();
             },
@@ -848,7 +1007,11 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
                 if (nextId !== prevId) {
                     playerHandoff.pendingDlnaSeek = -1;
                 }
-                if (!hasPlayedRef.current || !dlnaPlayer) return;
+                // Server-authoritative session: the server is the source of
+                // truth for `currentSong` and issues its own `playUrl` via
+                // `sendCurrentTrackFromSession()` when its index changes.
+                if (usePlayerStore.getState().isDlnaMode) return;
+                if (!hasPlayedRef.current || !dlnaPlayerRef.current) return;
                 if (nextId === prevId) return;
                 if (mountHandoffInProgressRef.current) return;
                 sendCurrentTrackToDlna();
@@ -860,10 +1023,14 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
             (state) => state.player.speed,
             async (newSpeed, oldSpeed) => {
                 if (newSpeed === oldSpeed) return;
-                if (!hasPlayedRef.current || !dlnaPlayer) return;
+                // Server-authoritative session: speed changes forward via
+                // the `setSpeed` RPC; the server re-prepares the speed
+                // transcode file and re-issues `playUrl` itself.
+                if (usePlayerStore.getState().isDlnaMode) return;
+                if (!hasPlayedRef.current || !dlnaPlayerRef.current) return;
 
                 try {
-                    pendingInitialSeek.value = await dlnaPlayer.getPosition();
+                    pendingInitialSeek.value = await dlnaPlayerRef.current.getPosition();
                 } catch {
                     pendingInitialSeek.value = 0;
                 }
@@ -880,10 +1047,12 @@ export const DlnaPlayerEngine = (props: DlnaPlayerEngineProps) => {
                 if (newPitch === oldPitch) return;
                 const currentSpeed = usePlayerStore.getState().player.speed || 1;
                 if (currentSpeed === 1) return;
-                if (!hasPlayedRef.current || !dlnaPlayer) return;
+                // Server-authoritative session: see speed subscription above.
+                if (usePlayerStore.getState().isDlnaMode) return;
+                if (!hasPlayedRef.current || !dlnaPlayerRef.current) return;
 
                 try {
-                    pendingInitialSeek.value = await dlnaPlayer.getPosition();
+                    pendingInitialSeek.value = await dlnaPlayerRef.current.getPosition();
                 } catch {
                     pendingInitialSeek.value = 0;
                 }

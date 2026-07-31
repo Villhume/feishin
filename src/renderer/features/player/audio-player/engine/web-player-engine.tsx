@@ -1,12 +1,21 @@
 import type { RefObject } from 'react';
 import type ReactPlayer from 'react-player';
 
+import isElectron from 'is-electron';
 import { useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react';
 
 import { AudioPlayer, PlayerOnProgressProps } from '/@/renderer/features/player/audio-player/types';
 import { convertToLogVolume } from '/@/renderer/features/player/audio-player/utils/player-utils';
 import { logger } from '/@/renderer/utils/logger';
 import { PlayerStatus } from '/@/shared/types/types';
+
+// `crossOrigin: 'anonymous'` makes the browser send a CORS request for the
+// audio stream.  When the Navidrome server doesn't return CORS headers (the
+// common case in Docker/web deployments), the browser blocks the audio and
+// the player is silent.  In Electron, the audio is sourced through the main
+// process and CORS isn't an issue, so we keep the attribute there to allow
+// Web Audio API analysis.  In web mode, drop it so the audio plays at all.
+const CROSS_ORIGIN = isElectron() ? { crossOrigin: 'anonymous' as const } : {};
 
 export interface WebPlayerEngineHandle extends AudioPlayer {
     player1(): {
@@ -320,7 +329,7 @@ export const WebPlayerEngine = (props: WebPlayerEngineProps) => {
         <div id="web-player-engine" style={{ display: 'none' }}>
             <ReactPlayerComponent
                 config={{
-                    file: { attributes: { crossOrigin: 'anonymous' }, forceAudio: true },
+                    file: { attributes: CROSS_ORIGIN, forceAudio: true },
                 }}
                 controls={false}
                 height={0}
@@ -346,7 +355,7 @@ export const WebPlayerEngine = (props: WebPlayerEngineProps) => {
             />
             <ReactPlayerComponent
                 config={{
-                    file: { attributes: { crossOrigin: 'anonymous' }, forceAudio: true },
+                    file: { attributes: CROSS_ORIGIN, forceAudio: true },
                 }}
                 controls={false}
                 height={0}

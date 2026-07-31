@@ -1,0 +1,69 @@
+# ---- Builder stage
+FROM node:23-alpine AS builder
+WORKDIR /app
+
+# Cache deps separately for faster rebuilds
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN corepack enable && corepack prepare pnpm@11.5.2 --activate
+RUN pnpm install --frozen-lockfile
+
+# Build the standalone casting server bundle. The output is a single
+# CJS file at out/server/index.js with only the `ws` package externalized.
+# See server.vite.config.ts for the build configuration.
+# The `test -s` guard fails the build if vite silently produced an empty
+# bundle (observed on Docker Desktop / WSL2 when the build OOM-crashes
+# partway through — without this check the runtime image ships a 0-byte
+# index.js and Node fails with ERR_INVALID_PACKAGE_CONFIG).
+COPY . .
+RUN pnpm run build:server && test -s out/server/index.js
+
+# Stage a lean runtime directory. The server bundle inlines all app
+# code via vite, so the only runtime external is `ws` (zero sub-deps).
+# We copy it and the original package.json into /runtime explicitly.
+# Previously this used `pnpm prune --prod`, which on pnpm 11 + Docker
+# Desktop/WSL2 occasionally produced a 0-byte package.json — causing
+# the runtime to crash with ERR_INVALID_PACKAGE_CONFIG.
+# NOTE: pnpm lays down `node_modules/ws` as a symlink into the .pnpm
+# virtual store, so we must `cp -L` (deref) or the destination ends
+# up as a dangling symlink.
+RUN mkdir -p /runtime/node_modules && \
+    cp -rL node_modules/ws /runtime/node_modules/ && \
+    cp package.json /runtime/package.json && \
+    test -s /runtime/package.json && \
+    test -s /runtime/node_modules/ws/package.json
+
+# ---- Runtime stage
+FROM node:23-alpine AS runtime
+
+# ffmpeg is required for speed transcoding (playback at 1.25x/1.5x/etc).
+# If it's missing the server still runs, but those flows are disabled and
+# the /health endpoint reports ffmpegPresent=false.
+RUN apk add --no-cache ffmpeg
+
+WORKDIR /app
+
+# Copy the bundled server, the lean node_modules (just `ws`), and the
+# original package.json from the staging directory.
+COPY --from=builder /app/out/server ./out/server
+COPY --from=builder /runtime/node_modules ./node_modules
+COPY --from=builder /runtime/package.json ./package.json
+
+# Env vars consumed by src/server/index.ts. See that file for details.
+ENV PORT=8180
+ENV AUTH_TOKEN=""
+ENV FFMPEG_PATH=""
+ENV OVERRIDE_LAN_IP=""
+ENV DISABLE_EVENT_SUBSCRIPTION=""
+
+# Expose the WS + /health port. The same HTTP server handles both.
+# If you're running behind a reverse proxy, map this to 80 or 443 and
+# set PORT accordingly.
+EXPOSE 8180
+
+# Healthcheck hits the /health endpoint. The server is "healthy" from a
+# container perspective even if the DLNA controller is not yet connected
+# to a device — we just need the HTTP server to respond.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8180)+'/health').then(r=>r.json()).then(b=>process.exit(b.ok?0:1)).catch(()=>process.exit(1))"
+
+CMD ["node", "out/server/index.js"]

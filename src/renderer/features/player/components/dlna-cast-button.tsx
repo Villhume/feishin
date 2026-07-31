@@ -1,20 +1,29 @@
+import type { CastQueueSnapshot, CastQueueSong } from '/@/shared/types/cast-types';
+
 import { Loader } from '@mantine/core';
-import isElectron from 'is-electron';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import type { DlnaDevice, GroupMember } from './dlna/types';
 
 import { playerHandoff } from '../audio-player/engine/player-handoff';
 
+import {
+    castSessionActions,
+    useCastSessionStore,
+} from '/@/renderer/features/player/api/cast-session-store';
+import { DlnaClientContext } from '/@/renderer/features/player/api/dlna-client-provider';
+import { resolveQueueSongUrls } from '/@/renderer/features/player/api/dlna-session-sync';
 import { DeviceList } from '/@/renderer/features/player/components/dlna/device-list';
 import { GroupBuilder } from '/@/renderer/features/player/components/dlna/group-builder';
 import {
     usePlaybackSettings,
     usePlayerActions,
     usePlayerVolume,
+    useSettingsStore,
     useSettingsStoreActions,
 } from '/@/renderer/store';
+import { usePlayerStoreBase } from '/@/renderer/store/player.store';
 import { useTimestampStoreBase } from '/@/renderer/store/timestamp.store';
 import { ActionIcon } from '/@/shared/components/action-icon/action-icon';
 import { Button } from '/@/shared/components/button/button';
@@ -25,11 +34,23 @@ import { Text } from '/@/shared/components/text/text';
 import { toast } from '/@/shared/components/toast/toast';
 import { PlayerType } from '/@/shared/types/types';
 
-const dlnaPlayer = isElectron() ? window.api.dlnaPlayer : null;
-const ipc = isElectron() ? window.api.ipc : null;
-const dlnaPlayerListener = isElectron() ? window.api.dlnaPlayerListener : null;
-
-type Screen = 'connected' | 'connecting' | 'expand-group' | 'group' | 'group-build' | 'idle';
+/**
+ * Popover-internal view state. Connection-level state (isConnected,
+ * deviceName, groupMembers, coordinator) lives in `useCastSessionStore` so
+ * it's shared across tabs and survives popover close/reopen. `screen` only
+ * governs what the popover shows when open.
+ *
+ * `view-connected` / `view-group` are the "casting to..." screens, derived
+ * from the store when the popover opens. `idle` shows device discovery.
+ * `connecting` / `group-build` / `expand-group` are transient flows.
+ */
+type Screen =
+    | 'connecting'
+    | 'expand-group'
+    | 'group-build'
+    | 'idle'
+    | 'view-connected'
+    | 'view-group';
 
 function isSonosDevice(device: DlnaDevice): boolean {
     return device.id.toUpperCase().includes('RINCON');
@@ -41,21 +62,41 @@ export const DlnaCastButton = () => {
     const { mediaPause, setVolume } = usePlayerActions();
     const volume = usePlayerVolume();
     const settings = usePlaybackSettings();
+    // Source of truth for the DLNA backend. See dlna-client-provider.tsx.
+    // `null` means DLNA is unavailable (Electron w/o IPC, web w/o server).
+    const { client: dlnaPlayer, clientKey, status } = useContext(DlnaClientContext);
 
+    // Connection-level state lives in the cast-session store so every tab
+    // shares the same source of truth. The provider populates it from the
+    // WS `hello` handshake; user actions (connect/group/disconnect) write
+    // to it here.
+    const isConnected = useCastSessionStore((s) => s.isConnected);
+    const connectedDeviceName = useCastSessionStore((s) => s.connectedDeviceName);
+    const groupMemberList = useCastSessionStore((s) => s.groupMembers);
+    const coordinator = useCastSessionStore((s) => s.coordinator);
+
+    // Stable ref to the current DLNA client. The memoized callbacks below
+    // (handleDiscover, handleSelect, etc.) read from this ref instead of the
+    // `dlnaPlayer` variable so they always see the latest client without
+    // needing it in their dependency arrays. Without this, the callbacks
+    // capture `null` on first render (before the WS handshake completes) and
+    // silently no-op every subsequent call — the stale-closure bug that
+    // caused "No DLNA devices found" in the web/Docker path.
+    const dlnaPlayerRef = useRef(dlnaPlayer);
+    dlnaPlayerRef.current = dlnaPlayer;
+
+    // Popover-internal view. Derived from the store when the popover opens
+    // (see the onClick handler in the ActionIcon below).
     const [screen, setScreen] = useState<Screen>('idle');
     const [showPopover, setShowPopover] = useState(false);
     const [devices, setDevices] = useState<DlnaDevice[]>([]);
     const [isLoading, setIsLoading] = useState(false);
-    const [connectedDeviceName, setConnectedDeviceName] = useState('');
-    const [groupMemberList, setGroupMemberList] = useState<GroupMember[]>([]);
     const [isShiftDown, setIsShiftDown] = useState(false);
-    const coordinatorRef = useRef<DlnaDevice | null>(null);
 
     const previousPlayerTypeRef = useRef<PlayerType>(
         settings.type === PlayerType.DLNA ? PlayerType.WEB : settings.type,
     );
 
-    const isConnected = screen === 'connected' || screen === 'group';
     const hasSonosDevices = devices.some(isSonosDevice);
     useEffect(() => {
         if (!showPopover) return;
@@ -69,11 +110,8 @@ export const DlnaCastButton = () => {
         };
     }, [showPopover]);
     useEffect(() => {
-        if (!dlnaPlayerListener) return;
-        const handler = (
-            _: unknown,
-            payload: { message: string; type: 'error' | 'info' | 'warning' },
-        ) => {
+        if (!dlnaPlayer) return;
+        const handler = (payload: { message: string; type: 'error' | 'info' | 'warning' }) => {
             if (payload.type === 'error') {
                 toast.error({ message: payload.message });
             } else if (payload.type === 'warning') {
@@ -82,42 +120,66 @@ export const DlnaCastButton = () => {
                 toast.info?.({ message: payload.message });
             }
         };
-        dlnaPlayerListener.rendererDlnaToast(handler);
-        return () => {
-            ipc?.removeAllListeners('renderer-dlna-toast');
-        };
-    }, []);
+        return dlnaPlayer.on('rendererDlnaToast', handler);
+    }, [dlnaPlayer, clientKey]);
 
     useEffect(() => {
-        if (!dlnaPlayerListener) return;
-        if (!ipc) return;
-        const handleGroupState = (_: unknown, state: GroupMember[]) => {
-            setGroupMemberList(state);
-            if (state.length > 1) {
-                setScreen('group');
-                setConnectedDeviceName(t('dlna.castingToGroup', { count: state.length }));
-            } else if (state.length === 1) {
-                setScreen('connected');
-                setConnectedDeviceName(state[0].device.name);
-                coordinatorRef.current = state[0].device as DlnaDevice;
-            } else {
-                if (coordinatorRef.current) {
-                    setScreen('connected');
-                    setConnectedDeviceName(coordinatorRef.current.name);
-                    setGroupMemberList([
-                        { device: coordinatorRef.current, isCoordinator: true, volume: 50 },
-                    ]);
+        if (!dlnaPlayer) return;
+        const handleGroupState = (state: GroupMember[]) => {
+            if (state.length === 0) {
+                // Server broadcasted an empty group state — the DLNA
+                // session has ended (originating tab disconnected, or
+                // server lost the device).  Revert this tab to local
+                // mode so the engine unmounts, store mutations stop
+                // forwarding to the server, and the cast button turns
+                // grey.  Without this, other tabs stay stuck in a zombie
+                // DLNA state after one tab disconnects.
+                if (usePlayerStoreBase.getState().isDlnaMode) {
+                    usePlayerStoreBase.setState({
+                        applyingRemoteUpdate: false,
+                        isDlnaMode: false,
+                    });
+                    const storeState = useSettingsStore.getState();
+                    const fallback = storeState.playback.previousPlayerType ?? PlayerType.WEB;
+                    if (storeState.playback.type !== fallback) {
+                        storeState.actions.setSettings({
+                            playback: {
+                                previousLocalVolume: undefined,
+                                previousPlayerType: undefined,
+                                type: fallback,
+                            },
+                        });
+                    }
                 }
+                castSessionActions.clear();
+                setScreen('idle');
+                return;
             }
+            // Server-pushed group updates replace the store's member list.
+            // The store derives `connectedDeviceName` and `coordinator`
+            // from the members; pass the translated group label so it wins
+            // over the default "N speakers" placeholder.
+            const label =
+                state.length > 1
+                    ? t('dlna.castingToGroup', { count: state.length })
+                    : state[0]?.device.name;
+            castSessionActions.setGroupMembers(state, label);
         };
-        dlnaPlayerListener.rendererDlnaGroupState(handleGroupState);
-        return () => {
-            ipc?.removeAllListeners('renderer-dlna-group-state');
-        };
-    }, [t]);
+        const unsubscribe = dlnaPlayer.on('rendererDlnaGroupState', handleGroupState);
+        // Paint the group state immediately if the client already has a
+        // cached snapshot (e.g. from the `hello` handshake on a secondary
+        // tab). The cast-session store is the source of truth for the cast
+        // button's blue state, but the member list (for the popover's group
+        // view) still benefits from this eager paint.
+        const cached = dlnaPlayer.getCachedGroupState?.();
+        if (cached && cached.length > 0) {
+            handleGroupState(cached);
+        }
+        return unsubscribe;
+    }, [t, dlnaPlayer, clientKey]);
     useEffect(() => {
-        if (!dlnaPlayerListener) return;
-        const handleDiscoveryUpdate = (_: unknown, updated: DlnaDevice[]) => {
+        if (!dlnaPlayer) return;
+        const handleDiscoveryUpdate = (updated: DlnaDevice[]) => {
             setDevices((current) => {
                 if (screen !== 'idle') return current;
                 const hasNewGroups = updated.some((d) => d.groupMembers);
@@ -125,18 +187,16 @@ export const DlnaCastButton = () => {
                 return updated;
             });
         };
-        dlnaPlayerListener.rendererDlnaDiscoveryUpdate(handleDiscoveryUpdate);
-        return () => {
-            ipc?.removeAllListeners('renderer-dlna-discovery-update');
-        };
-    }, [screen]);
+        return dlnaPlayer.on('rendererDlnaDiscoveryUpdate', handleDiscoveryUpdate);
+    }, [screen, dlnaPlayer, clientKey]);
 
     const handleDiscover = useCallback(async () => {
-        if (!dlnaPlayer) return;
+        const client = dlnaPlayerRef.current;
+        if (!client) return;
         setDevices([]);
         setIsLoading(true);
         try {
-            setDevices(await dlnaPlayer.discover());
+            setDevices(await client.discover());
         } catch {
             setDevices([]);
         } finally {
@@ -145,17 +205,114 @@ export const DlnaCastButton = () => {
     }, []);
 
     const refreshGroupState = useCallback(async () => {
-        if (!dlnaPlayer) return;
+        const client = dlnaPlayerRef.current;
+        if (!client) return;
         try {
-            setGroupMemberList(await dlnaPlayer.getGroupState());
+            const state = await client.getGroupState();
+            const label =
+                state.length > 1
+                    ? t('dlna.castingToGroup', { count: state.length })
+                    : state[0]?.device.name;
+            castSessionActions.setGroupMembers(state, label);
         } catch {
             // Catch
         }
-    }, []);
+    }, [t]);
+
+    /**
+     * Server-authoritative session: hand the current renderer queue + player
+     * state to the server. The server now owns the queue; local mutations
+     * forward via RPC. Skipped when:
+     *   - The device was already playing something (the server-side session
+     *     likely already has a queue — `hello.queueState` on reconnect
+     *     will populate us instead).
+     *   - The client isn't WS-backed (Electron IPC path keeps using the
+     *     legacy `playUrl` mechanism).
+     *   - The queue is empty (nothing to hand over).
+     *
+     * Resolves stream URLs / album art / MIME types for every song before
+     * sending — the server has no Navidrome API client and can't resolve
+     * these itself. Without resolution, the server's
+     * `sendCurrentTrackFromSession()` finds `song.resolvedStreamUrl`
+     * undefined and bails without issuing `playUrl` to the device.
+     * Resolution runs in parallel via `Promise.all`; for a typical queue
+     * of 50-200 songs this completes in 1-3 seconds (parallel HEAD
+     * requests), during which the popover shows the "connecting" spinner.
+     *
+     * Sends the snapshot first, THEN flips `isDlnaMode` so state mutations
+     * during the await don't race back to the server.
+     */
+    const handoffQueueToServer = useCallback(
+        async (
+            client: { isWsClient: boolean } & {
+                setQueue: (
+                    queue: CastQueueSnapshot,
+                    playerState?: Partial<import('/@/shared/types/cast-types').CastPlayerState>,
+                ) => Promise<{ ok: boolean }>;
+            },
+            volume: number,
+            currentTimestamp: number,
+        ) => {
+            if (!client.isWsClient || playerHandoff.deviceAlreadyPlaying) return;
+            const storeState = usePlayerStoreBase.getState();
+            const queueItems = storeState.getQueueOrder().items;
+            // Always call `client.setQueue(...)`, even when the queue is
+            // empty.  The previous early-return here set `isDlnaMode` on
+            // the renderer but never told the server to flip
+            // `serverAuthoritative = true`, so all subsequent
+            // `sessionSet*` RPCs (shuffle, repeat, speed, ...) returned
+            // `{ ok: false }` and were silently dropped — breaking
+            // shuffle/repeat sync between tabs.
+            //
+            // The server's `setQueue` handler (controller.ts) handles
+            // empty snapshots: it stores them, flips
+            // `serverAuthoritative = true`, broadcasts
+            // `rendererQueueState`, and if there's no current song,
+            // `sendCurrentTrackFromSession` returns early without firing
+            // a device command.  Safe.
+            let snapshot: CastQueueSnapshot;
+            if (queueItems.length === 0) {
+                snapshot = { default: [], shuffled: [], songs: {} };
+            } else {
+                // Resolve stream URLs / album art / MIME types for every
+                // song in parallel.  The server uses these verbatim when
+                // it calls `playUrl` on the device — without them,
+                // playback never starts.
+                const transcode = useSettingsStore.getState().playback.transcode;
+                const songs = storeState.queue.songs;
+                const resolved = await Promise.all(
+                    Object.values(songs).map((song) => resolveQueueSongUrls(song, transcode)),
+                );
+                const resolvedSongs: Record<string, CastQueueSong> = {};
+                for (const song of resolved) {
+                    resolvedSongs[song._uniqueId] = song;
+                }
+                snapshot = {
+                    default: storeState.queue.default,
+                    shuffled: storeState.queue.shuffled,
+                    songs: resolvedSongs,
+                };
+            }
+            const playerPatch = {
+                index: storeState.player.index,
+                muted: storeState.player.muted,
+                repeat: storeState.player.repeat,
+                seekTo: currentTimestamp > 0 ? currentTimestamp : -1,
+                shuffle: storeState.player.shuffle,
+                speed: storeState.player.speed,
+                status: storeState.player.status,
+                volume,
+            };
+            await client.setQueue(snapshot, playerPatch);
+            usePlayerStoreBase.setState({ isDlnaMode: true });
+        },
+        [],
+    );
 
     const handleSelect = useCallback(
         async (device: DlnaDevice) => {
-            if (!dlnaPlayer) return;
+            const client = dlnaPlayerRef.current;
+            if (!client) return;
             const currentTimestamp = useTimestampStoreBase.getState().timestamp;
             if (currentTimestamp > 0) {
                 playerHandoff.pendingDlnaSeek = currentTimestamp;
@@ -164,11 +321,14 @@ export const DlnaCastButton = () => {
                 previousPlayerTypeRef.current = settings.type;
             }
             setScreen('connecting');
-            const result = await dlnaPlayer.connect(device);
+            const result = await client.connect(device);
             if (result.success) {
-                coordinatorRef.current = device;
                 setVolume(result.volume);
                 if (result.currentUri && result.currentTransportState !== 'STOPPED') {
+                    playerHandoff.deviceTransportState = result.currentTransportState;
+                    playerHandoff.deviceCurrentUri = result.currentUri;
+                    playerHandoff.deviceNextUri = result.nextUri || '';
+                    playerHandoff.devicePosition = result.currentPosition || 0;
                     if (result.currentTransportState === 'PAUSED_PLAYBACK') {
                         playerHandoff.deviceAlreadyPlaying = true;
                         playerHandoff.deviceWasPaused = true;
@@ -177,6 +337,8 @@ export const DlnaCastButton = () => {
                         playerHandoff.deviceAlreadyPlaying = true;
                         playerHandoff.deviceWasPaused = false;
                     }
+                } else if (!result.currentUri) {
+                    await handoffQueueToServer(client, result.volume, currentTimestamp);
                 }
                 setSettings({
                     playback: {
@@ -193,27 +355,31 @@ export const DlnaCastButton = () => {
                         isCoordinator: m.id === device.id,
                         volume: m.id === device.id ? result.volume : 50,
                     }));
-                    setGroupMemberList(initialMembers);
-                    setConnectedDeviceName(
-                        t('dlna.castingToGroup', { count: initialMembers.length }),
-                    );
-                    setScreen('group');
+                    castSessionActions.setConnected({
+                        connectedDeviceName: t('dlna.castingToGroup', {
+                            count: initialMembers.length,
+                        }),
+                        groupMembers: initialMembers,
+                    });
+                    setScreen('view-group');
                 } else {
-                    setConnectedDeviceName(device.name);
-                    setGroupMemberList([{ device, isCoordinator: true, volume: result.volume }]);
-                    setScreen('connected');
+                    castSessionActions.setConnected({
+                        groupMembers: [{ device, isCoordinator: true, volume: result.volume }],
+                    });
+                    setScreen('view-connected');
                 }
             } else {
                 playerHandoff.pendingDlnaSeek = -1;
                 setScreen('idle');
             }
         },
-        [setSettings, setVolume, settings, volume, t],
+        [handoffQueueToServer, setSettings, setVolume, settings, volume, t],
     );
 
     const handleGroupConfirm = useCallback(
-        async (selected: DlnaDevice[], coordinator: DlnaDevice) => {
-            if (!dlnaPlayer || selected.length < 2) return;
+        async (selected: DlnaDevice[], coordinatorDevice: DlnaDevice) => {
+            const client = dlnaPlayerRef.current;
+            if (!client || selected.length < 2) return;
             const currentTimestamp = useTimestampStoreBase.getState().timestamp;
             if (currentTimestamp > 0) {
                 playerHandoff.pendingDlnaSeek = currentTimestamp;
@@ -222,7 +388,7 @@ export const DlnaCastButton = () => {
                 previousPlayerTypeRef.current = settings.type;
             }
             setScreen('connecting');
-            const result = await dlnaPlayer.connect(coordinator);
+            const result = await client.connect(coordinatorDevice);
             if (!result.success) {
                 playerHandoff.pendingDlnaSeek = -1;
                 setScreen('group-build');
@@ -237,8 +403,9 @@ export const DlnaCastButton = () => {
                     playerHandoff.deviceAlreadyPlaying = true;
                     playerHandoff.deviceWasPaused = false;
                 }
+            } else if (!result.currentUri) {
+                await handoffQueueToServer(client, result.volume, currentTimestamp);
             }
-            coordinatorRef.current = coordinator;
             setVolume(result.volume);
             setSettings({
                 playback: {
@@ -250,10 +417,10 @@ export const DlnaCastButton = () => {
                 },
             });
             const initialMembers: GroupMember[] = [
-                { device: coordinator, isCoordinator: true, volume: result.volume },
+                { device: coordinatorDevice, isCoordinator: true, volume: result.volume },
             ];
-            for (const member of selected.filter((d) => d.id !== coordinator.id)) {
-                const r = await dlnaPlayer.addGroupMember(member);
+            for (const member of selected.filter((d) => d.id !== coordinatorDevice.id)) {
+                const r = await client.addGroupMember(member);
                 if (r.success) {
                     initialMembers.push({ device: member, isCoordinator: false, volume: 50 });
                 } else {
@@ -263,20 +430,25 @@ export const DlnaCastButton = () => {
                     });
                 }
             }
-            setGroupMemberList(initialMembers);
-            setConnectedDeviceName(t('dlna.castingToGroup', { count: initialMembers.length }));
-            setScreen('group');
+            castSessionActions.setConnected({
+                connectedDeviceName: t('dlna.castingToGroup', {
+                    count: initialMembers.length,
+                }),
+                groupMembers: initialMembers,
+            });
+            setScreen('view-group');
         },
-        [setSettings, setVolume, settings, volume, t],
+        [handoffQueueToServer, setSettings, setVolume, settings, volume, t],
     );
 
     const handleExpandGroupConfirm = useCallback(
         async (selected: DlnaDevice[], coordinator: DlnaDevice) => {
-            if (!dlnaPlayer) return;
+            const client = dlnaPlayerRef.current;
+            if (!client) return;
             const toAdd = selected.filter((d) => d.id !== coordinator.id);
             const newMembers = [...groupMemberList];
             for (const member of toAdd) {
-                const r = await dlnaPlayer.addGroupMember(member);
+                const r = await client.addGroupMember(member);
                 if (r.success) {
                     newMembers.push({ device: member, isCoordinator: false, volume: 50 });
                 } else {
@@ -286,53 +458,81 @@ export const DlnaCastButton = () => {
                     });
                 }
             }
-            setGroupMemberList(newMembers);
-            setConnectedDeviceName(t('dlna.castingToGroup', { count: newMembers.length }));
-            setScreen('group');
+            castSessionActions.setGroupMembers(
+                newMembers,
+                t('dlna.castingToGroup', { count: newMembers.length }),
+            );
+            setScreen('view-group');
         },
         [groupMemberList, t],
     );
 
     const handleRemoveMember = useCallback(
         async (deviceId: string) => {
-            if (!dlnaPlayer) return;
-            await dlnaPlayer.removeGroupMember(deviceId);
-            setGroupMemberList((prev) => {
-                const next = prev.filter((m) => m.device.id !== deviceId);
-                if (next.length === 1) {
-                    setConnectedDeviceName(next[0].device.name);
-                    setScreen('connected');
-                } else {
-                    setConnectedDeviceName(t('dlna.castingToGroup', { count: next.length }));
-                }
-                return next;
-            });
+            const client = dlnaPlayerRef.current;
+            if (!client) return;
+            await client.removeGroupMember(deviceId);
+            const next = groupMemberList.filter((m) => m.device.id !== deviceId);
+            if (next.length === 1) {
+                castSessionActions.setConnected({
+                    groupMembers: next,
+                });
+                setScreen('view-connected');
+            } else {
+                castSessionActions.setGroupMembers(
+                    next,
+                    t('dlna.castingToGroup', { count: next.length }),
+                );
+            }
         },
-        [t],
+        [groupMemberList, t],
     );
 
     const handleDisconnect = useCallback(async () => {
-        if (!dlnaPlayer) return;
-        const position = await dlnaPlayer.getPosition();
+        const client = dlnaPlayerRef.current;
+        if (!client) return;
+        const position = await client.getPosition();
         if (position > 0) playerHandoff.pendingLocalSeek = position;
 
         if (isShiftDown) {
-            await dlnaPlayer.disconnectPassive();
+            await client.disconnectPassive();
             mediaPause?.();
         } else {
-            await dlnaPlayer.disconnect();
+            await client.disconnect();
         }
 
+        // Server-authoritative session: revert to local-owned queue. Any
+        // subsequent store action mutates locally (or whichever engine
+        // takes over after PlayerType switches back). Also clear
+        // `applyingRemoteUpdate` in case a remote update was in flight.
+        usePlayerStoreBase.setState({
+            applyingRemoteUpdate: false,
+            isDlnaMode: false,
+        });
+
+        castSessionActions.clear();
         setScreen('idle');
-        setConnectedDeviceName('');
-        setGroupMemberList([]);
-        coordinatorRef.current = null;
         setShowPopover(false);
+        // Read `previousPlayerType` from the persisted store, not the local
+        // ref. The ref is only updated in `handleSelect`/`handleGroupConfirm`
+        // (originating-tab connect), but a secondary tab that connected via
+        // WS `onHello` never updates the ref — the provider wrote
+        // `previousPlayerType` to the store instead. Reading from the store
+        // ensures both paths get the correct pre-DLNA player type.
+        const storeState = useSettingsStore.getState();
+        const previousType = storeState.playback.previousPlayerType;
         const nextType =
-            previousPlayerTypeRef.current === PlayerType.DLNA
+            previousType === undefined || previousType === PlayerType.DLNA
                 ? PlayerType.WEB
-                : previousPlayerTypeRef.current;
-        setSettings({ playback: { ...settings, type: nextType } });
+                : previousType;
+        setSettings({
+            playback: {
+                ...settings,
+                previousLocalVolume: undefined,
+                previousPlayerType: undefined,
+                type: nextType,
+            },
+        });
         if (settings.previousLocalVolume !== undefined) setVolume(settings.previousLocalVolume);
         setDevices([]);
         void handleDiscover();
@@ -356,11 +556,28 @@ export const DlnaCastButton = () => {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
-    if (!isElectron()) return null;
+    // Render the cast button whenever a DLNA backend is available. This
+    // replaces the old `isElectron()` gate so the button also shows up in
+    // the web/Docker build when a casting server is configured.
+    //
+    // During a WS reconnect, the provider keeps the stale client in state
+    // (so commands no-op rather than crash) and transitions `status` to
+    // `'connecting'`.  We keep the button mounted during that window —
+    // otherwise it would flicker out for the 1-30s backoff duration every
+    // time the network blips.  Only when there is truly no backend (i.e.
+    // `idle`/`disabled`/`error` with no client) do we return null.
+    if (!dlnaPlayer && status !== 'connecting') return null;
+
+    // Look up the full DlnaDevice for the coordinator (the store only holds
+    // id + name). Falls back to the first group member if the coordinator
+    // entry isn't found.
+    const coordinatorDevice =
+        groupMemberList.find((m) => m.device.id === coordinator?.id)?.device ??
+        (groupMemberList[0]?.device as DlnaDevice | undefined);
 
     const expandGroupDevices = devices.filter(
         (d) =>
-            d.id === coordinatorRef.current?.id ||
+            d.id === coordinator?.id ||
             (isSonosDevice(d) &&
                 !d.groupMembers &&
                 !groupMemberList.some((m) => m.device.id === d.id)),
@@ -381,6 +598,13 @@ export const DlnaCastButton = () => {
                                 setScreen('idle');
                                 void handleDiscover();
                             } else {
+                                // Derive the popover's view from the store
+                                // state so opening the popover in a
+                                // secondary tab shows "now casting" rather
+                                // than the discovery list.
+                                setScreen(
+                                    groupMemberList.length > 1 ? 'view-group' : 'view-connected',
+                                );
                                 void refreshGroupState();
                             }
                         }
@@ -388,7 +612,7 @@ export const DlnaCastButton = () => {
                     size="sm"
                     tooltip={{
                         label: isConnected
-                            ? screen === 'group'
+                            ? groupMemberList.length > 1
                                 ? t('dlna.castingToGroup', { count: groupMemberList.length })
                                 : t('dlna.castingToDevice', { name: connectedDeviceName })
                             : t('dlna.castToDevice'),
@@ -415,13 +639,15 @@ export const DlnaCastButton = () => {
                             onRefresh={handleDiscover}
                         />
                     )}
-                    {screen === 'expand-group' && coordinatorRef.current && (
+                    {screen === 'expand-group' && coordinatorDevice && (
                         <GroupBuilder
                             devices={expandGroupDevices}
                             isLoading={isLoading}
-                            lockedCoordinator={coordinatorRef.current}
+                            lockedCoordinator={coordinatorDevice}
                             onCancel={() =>
-                                setScreen(groupMemberList.length > 1 ? 'group' : 'connected')
+                                setScreen(
+                                    groupMemberList.length > 1 ? 'view-group' : 'view-connected',
+                                )
                             }
                             onConfirm={handleExpandGroupConfirm}
                             onRefresh={handleDiscover}
@@ -504,7 +730,7 @@ export const DlnaCastButton = () => {
                             )}
                         </>
                     )}
-                    {screen === 'connected' && (
+                    {screen === 'view-connected' && (
                         <>
                             <Text fw="600" pb="md" size="sm" ta="center">
                                 {t('dlna.nowCasting')}
@@ -514,22 +740,21 @@ export const DlnaCastButton = () => {
                                 {connectedDeviceName}
                             </Text>
                             <Group gap="xs" mt="sm">
-                                {coordinatorRef.current &&
-                                    isSonosDevice(coordinatorRef.current) && (
-                                        <Button
-                                            flex={1}
-                                            leftSection={<AppIcon.group size={12} />}
-                                            onClick={(e) => {
-                                                e.stopPropagation();
-                                                setScreen('expand-group');
-                                                void handleDiscover();
-                                            }}
-                                            size="xs"
-                                            variant="outline"
-                                        >
-                                            {t('dlna.group.addToGroup')}
-                                        </Button>
-                                    )}
+                                {coordinatorDevice && isSonosDevice(coordinatorDevice) && (
+                                    <Button
+                                        flex={1}
+                                        leftSection={<AppIcon.group size={12} />}
+                                        onClick={(e) => {
+                                            e.stopPropagation();
+                                            setScreen('expand-group');
+                                            void handleDiscover();
+                                        }}
+                                        size="xs"
+                                        variant="outline"
+                                    >
+                                        {t('dlna.group.addToGroup')}
+                                    </Button>
+                                )}
                                 <Button
                                     color={isShiftDown ? 'white' : 'red'}
                                     flex={1}
@@ -559,7 +784,7 @@ export const DlnaCastButton = () => {
                             </Text>
                         </>
                     )}
-                    {screen === 'group' && (
+                    {screen === 'view-group' && (
                         <>
                             <Text fw="600" pb="md" size="sm" ta="center">
                                 {t('dlna.group.title', { count: groupMemberList.length })}

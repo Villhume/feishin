@@ -1,3 +1,4 @@
+import type { WsDlnaClient } from '/@/renderer/features/player/api/dlna-ws-client';
 import type { ErrorInfo, ReactNode } from 'react';
 
 import isElectron from 'is-electron';
@@ -6,6 +7,9 @@ import { Component, useEffect, useState } from 'react';
 import { eventEmitter } from '/@/renderer/events/event-emitter';
 import { UserFavoriteEventPayload, UserRatingEventPayload } from '/@/renderer/events/events';
 import { DiscordRpcHook } from '/@/renderer/features/discord-rpc/use-discord-rpc';
+import { useCastSessionStore } from '/@/renderer/features/player/api/cast-session-store';
+import { useDlnaClient } from '/@/renderer/features/player/api/dlna-client-provider';
+import { useDlnaSessionSync } from '/@/renderer/features/player/api/dlna-session-sync';
 import { DlnaPlayer } from '/@/renderer/features/player/audio-player/dlna-player';
 import { MainPlayerListenerHook } from '/@/renderer/features/player/audio-player/hooks/use-main-player-listener';
 import { JukeboxPlayer } from '/@/renderer/features/player/audio-player/jukebox-player';
@@ -38,6 +42,7 @@ import { useSettingsStore } from '/@/renderer/store';
 import {
     updateQueueFavorites,
     updateQueueRatings,
+    useCastSettings,
     useCurrentServerId,
     usePlaybackSettings,
     usePlaybackType,
@@ -117,11 +122,49 @@ export const AudioPlayers = () => {
     const playbackType = usePlaybackType();
     const serverId = useCurrentServerId();
     const { resetSampleRate, setSettings } = useSettingsStoreActions();
-    // DLNA requires an active connection — fall back to web on startup
+    // Subscribe to server-authoritative queue/player state events when a
+    // WS-backed DLNA client is available. The hook internally no-ops when
+    // the client is null or is the Electron IPC variant.
+    const dlnaClient = useDlnaClient();
+    useDlnaSessionSync(dlnaClient as null | WsDlnaClient);
+    // `cast` is hydrated synchronously from localStorage by Zustand persist,
+    // so it's available on first render (unlike `dlnaClient`, which resolves
+    // only after the WS handshake). We read it here to determine whether this
+    // tab is on the WS path (web/Docker: `auto` or `manual`) or the Electron
+    // IPC path.
+    const cast = useCastSettings();
+    // DLNA requires an active connection — fall back to web on startup.
+    // Skip the reset when this tab is on the WS path (web/Docker):
+    //   - The WS casting server is the source of truth for the session.
+    //   - On mount, the persisted `playbackType` may be DLNA (carried over
+    //     from an earlier tab) but the WS handshake to the server hasn't
+    //     completed yet (~100-500ms). Resetting to WEB here would cause the
+    //     DLNA engine to unmount, then `onHello` remounts it — flickering
+    //     the UI and potentially interrupting playback on the speaker.
+    //   - When `onHello` arrives with `hello.connected === false` (no active
+    //     session on the server — a stale persisted DLNA type), the handler
+    //     in `dlna-client-provider.tsx` resets `playbackType` to WEB itself.
+    // The reset is still needed in the Electron path where there's no WS
+    // server keeping the session alive across app restarts.
+    //
+    // `castConnected` gates the DLNA engine render on the WS path.  When
+    // `playbackType` is persisted as `DLNA` from a prior tab but the
+    // `hello` handshake hasn't arrived yet, the player store still has
+    // default state (status=PAUSED, index=0, seekTo=-1).  Rendering the
+    // DLNA engine in that window shows "paused at position 0" briefly
+    // before `onHello` applies the snapshot.  Holding `null` until
+    // `castConnected` flips ensures the engine mounts only after the
+    // snapshot is in the store — no UI flash, no spurious commands.
+    const castConnected = useCastSessionStore((s) => s.isConnected);
     const [mountChecked, setMountChecked] = useState(false);
     useEffect(() => {
         if (playbackType === PlayerType.DLNA) {
-            setSettings({ playback: { type: PlayerType.WEB } });
+            const isWsPath = cast.mode === 'auto' || cast.mode === 'manual';
+            if (isWsPath) {
+                // WS path — let `onHello` drive the state. Skip the reset.
+            } else {
+                setSettings({ playback: { type: PlayerType.WEB } });
+            }
         }
         setMountChecked(true);
         // Only run on mount
@@ -136,7 +179,16 @@ export const AudioPlayers = () => {
     useEffect(() => {
         detectBrowserProfile();
     }, []);
-    if (!mountChecked) return null;
+    // On the WS path, if `playbackType` is persisted as `DLNA` but no
+    // session is connected yet, hold off rendering any engine until the
+    // `hello` handshake arrives.  This prevents (a) the DLNA engine from
+    // mounting with default state (paused/position 0), and (b) the WEB
+    // player from briefly mounting and potentially starting local audio
+    // playback with the persisted queue.  Must come AFTER all hooks to
+    // satisfy `react-hooks/rules-of-hooks`.
+    const isWsPath = cast.mode === 'auto' || cast.mode === 'manual';
+    const waitingForHello = isWsPath && playbackType === PlayerType.DLNA && !castConnected;
+    if (!mountChecked || waitingForHello) return null;
     return (
         <>
             <SleepTimerHook />
@@ -212,84 +264,91 @@ const AudioPlayersContent = ({
     }, []);
 
     useEffect(() => {
-        if (webAudio && 'AudioContext' in window) {
-            let context: AudioContext;
-
-            try {
-                context = new AudioContext({
-                    latencyHint: 'playback',
-                    sampleRate: audioSampleRateHz || undefined,
-                });
-            } catch (error) {
-                // In practice, this should never be hit because the UI should validate
-                // the range. However, the actual supported range is not guaranteed
-                toast.error({ message: (error as Error).message });
-                context = new AudioContext({ latencyHint: 'playback' });
-                resetSampleRate();
-            }
-
-            const gains = [context.createGain(), context.createGain()];
-
-            // Build DSP chain from persisted settings so EQ/compressor
-            // are active immediately on first playback, not just after
-            // the user opens the settings panel.
-            const { compressor, equalizer } = useSettingsStore.getState().playback;
-
-            // Preamp gain — converts dB to linear
-            const preampGain = context.createGain();
-            preampGain.gain.value = equalizer.enabled ? Math.pow(10, equalizer.preamp / 20) : 1;
-
-            // One peaking BiquadFilterNode per EQ band
-            const eqFilters: BiquadFilterNode[] = equalizer.bands.map((band) => {
-                const filter = context.createBiquadFilter();
-                filter.type = 'peaking';
-                filter.frequency.value = band.freq;
-                // Q of 1.41 gives roughly 1-octave bandwidth per band
-                filter.Q.value = 1.41;
-                filter.gain.value = equalizer.enabled ? band.gain : 0;
-                return filter;
-            });
-
-            // DynamicsCompressorNode — always present, pass-through when disabled
-            // (ratio=1, threshold=0 = mathematically transparent)
-            const compressorNode = context.createDynamicsCompressor();
-            if (compressor.enabled) {
-                compressorNode.threshold.value = compressor.threshold;
-                compressorNode.ratio.value = compressor.ratio;
-                compressorNode.attack.value = compressor.attack / 1000;
-                compressorNode.release.value = compressor.release / 1000;
-                compressorNode.knee.value = compressor.knee;
-            } else {
-                compressorNode.threshold.value = 0;
-                compressorNode.ratio.value = 1;
-                compressorNode.attack.value = 0;
-                compressorNode.release.value = 0.25;
-                compressorNode.knee.value = 0;
-            }
-
-            // Wire: each gain → preamp → eq[0] → eq[1] → ... → compressor → destination
-            for (const gain of gains) {
-                gain.connect(preampGain);
-            }
-
-            if (eqFilters.length > 0) {
-                preampGain.connect(eqFilters[0]);
-                for (let i = 0; i < eqFilters.length - 1; i++) {
-                    eqFilters[i].connect(eqFilters[i + 1]);
-                }
-                eqFilters[eqFilters.length - 1].connect(compressorNode);
-            } else {
-                preampGain.connect(compressorNode);
-            }
-
-            compressorNode.connect(context.destination);
-
-            setWebAudio!({
-                context,
-                dsp: { compressor: compressorNode, eqFilters, preampGain },
-                gains,
-            });
+        // Web Audio API requires CORS-compliant audio sources.  In web/Docker
+        // mode the audio element streams directly from a Navidrome server on
+        // another origin, which does not return CORS headers, so
+        // `createMediaElementSource()` would output silence.  Restrict Web
+        // Audio (EQ, compressor, replay-gain, visualizer) to Electron where
+        // the main process can route the audio through its own stream proxy.
+        if (!isElectron() || !webAudio || !('AudioContext' in window)) {
+            return;
         }
+        let context: AudioContext;
+
+        try {
+            context = new AudioContext({
+                latencyHint: 'playback',
+                sampleRate: audioSampleRateHz || undefined,
+            });
+        } catch (error) {
+            // In practice, this should never be hit because the UI should validate
+            // the range. However, the actual supported range is not guaranteed
+            toast.error({ message: (error as Error).message });
+            context = new AudioContext({ latencyHint: 'playback' });
+            resetSampleRate();
+        }
+
+        const gains = [context.createGain(), context.createGain()];
+
+        // Build DSP chain from persisted settings so EQ/compressor
+        // are active immediately on first playback, not just after
+        // the user opens the settings panel.
+        const { compressor, equalizer } = useSettingsStore.getState().playback;
+
+        // Preamp gain — converts dB to linear
+        const preampGain = context.createGain();
+        preampGain.gain.value = equalizer.enabled ? Math.pow(10, equalizer.preamp / 20) : 1;
+
+        // One peaking BiquadFilterNode per EQ band
+        const eqFilters: BiquadFilterNode[] = equalizer.bands.map((band) => {
+            const filter = context.createBiquadFilter();
+            filter.type = 'peaking';
+            filter.frequency.value = band.freq;
+            // Q of 1.41 gives roughly 1-octave bandwidth per band
+            filter.Q.value = 1.41;
+            filter.gain.value = equalizer.enabled ? band.gain : 0;
+            return filter;
+        });
+
+        // DynamicsCompressorNode — always present, pass-through when disabled
+        // (ratio=1, threshold=0 = mathematically transparent)
+        const compressorNode = context.createDynamicsCompressor();
+        if (compressor.enabled) {
+            compressorNode.threshold.value = compressor.threshold;
+            compressorNode.ratio.value = compressor.ratio;
+            compressorNode.attack.value = compressor.attack / 1000;
+            compressorNode.release.value = compressor.release / 1000;
+            compressorNode.knee.value = compressor.knee;
+        } else {
+            compressorNode.threshold.value = 0;
+            compressorNode.ratio.value = 1;
+            compressorNode.attack.value = 0;
+            compressorNode.release.value = 0.25;
+            compressorNode.knee.value = 0;
+        }
+
+        // Wire: each gain → preamp → eq[0] → eq[1] → ... → compressor → destination
+        for (const gain of gains) {
+            gain.connect(preampGain);
+        }
+
+        if (eqFilters.length > 0) {
+            preampGain.connect(eqFilters[0]);
+            for (let i = 0; i < eqFilters.length - 1; i++) {
+                eqFilters[i].connect(eqFilters[i + 1]);
+            }
+            eqFilters[eqFilters.length - 1].connect(compressorNode);
+        } else {
+            preampGain.connect(compressorNode);
+        }
+
+        compressorNode.connect(context.destination);
+
+        setWebAudio!({
+            context,
+            dsp: { compressor: compressorNode, eqFilters, preampGain },
+            gains,
+        });
 
         // Intentionally ignore the sample rate dependency, as it makes things really messy
         // eslint-disable-next-line react-hooks/exhaustive-deps

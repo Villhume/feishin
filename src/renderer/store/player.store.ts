@@ -31,6 +31,23 @@ export interface PlayerState extends Actions, State {}
 
 export type QueueGroupingProperty = keyof QueueSong;
 
+// ---------------------------------------------------------------------------
+// Phase E — server-authoritative session sender
+// ---------------------------------------------------------------------------
+//
+// When the renderer is in DLNA mode and the WS client supports
+// server-authoritative session RPCs (`isWsClient === true`), player
+// store actions forward to the server instead of mutating local state.
+// The state arrives asynchronously via the `rendererQueueState` /
+// `rendererPlayerState` event channels (see `dlna-session-sync.ts`).
+//
+// `setSessionRpcSender` is called from `dlna-client-provider.tsx`
+// whenever a new client mounts (including the stale-client-during-
+// reconnect path of Phase B).  Passing `null` clears it.
+
+let sessionRpcSender: import('/@/renderer/features/player/api/dlna-client').DlnaClient | null =
+    null;
+
 interface Actions {
     addToQueueByType: (items: Song[], playType: Play, playSongId?: string) => void;
     addToQueueByUniqueId: (
@@ -91,7 +108,26 @@ interface GroupedQueue {
 }
 
 interface State {
+    /**
+     *  True while the store is applying a state change that
+     *  originated from a server broadcast (see
+     *  `dlna-session-sync.ts`).  Actions check this to avoid
+     *  re-forwarding the change back to the server, which would
+     *  loop infinitely.
+     */
+    applyingRemoteUpdate: boolean;
     hydrated: boolean;
+    /**
+     *  True when the renderer is in DLNA mode AND the server is
+     *  authoritative for queue + player state (Phase E).  Player
+     *  store actions that would mutate local state instead forward
+     *  to the server via the `sessionRpcSender` and bail out early;
+     *  the resulting state arrives asynchronously via the
+     *  `rendererQueueState` / `rendererPlayerState` event channels.
+     *  Cleared on disconnect (see `dlna-cast-button.tsx`
+     *  `handleDisconnect`).
+     */
+    isDlnaMode: boolean;
     player: {
         crossfadeDuration: number;
         crossfadeStyle: CrossfadeStyle;
@@ -156,6 +192,19 @@ export function getDualPlayerSongs(
     };
 }
 
+/**
+ *  Returns the currently-registered session RPC sender (or `null`).
+ *  Used by `enqueueWithResolvedUrls` in `dlna-session-sync.ts` to call
+ *  `queueAdd` after pre-resolving stream URLs.  Store actions themselves
+ *  use the module-private `sessionRpcSender` directly + `shouldForwardToServer`
+ *  — this getter is just for the helper.
+ */
+export function getSessionRpcSender():
+    | import('/@/renderer/features/player/api/dlna-client').DlnaClient
+    | null {
+    return sessionRpcSender;
+}
+
 // Helper function to check if shuffle is enabled
 export function isShuffleEnabled(state: {
     player: { shuffle: PlayerShuffle };
@@ -170,6 +219,12 @@ export function mapShuffledToQueueIndex(shuffledIndex: number, shuffled: number[
         return shuffled[shuffledIndex];
     }
     return shuffledIndex;
+}
+
+export function setSessionRpcSender(
+    client: import('/@/renderer/features/player/api/dlna-client').DlnaClient | null,
+): void {
+    sessionRpcSender = client;
 }
 
 // Helper function to add new indexes to shuffled array after current position
@@ -328,8 +383,29 @@ function regenerateShuffledIndexesIfNeeded(state: {
     }
 }
 
+/**
+ *  Returns true when the current store action should forward to the
+ *  server instead of mutating local state.  Checks:
+ *   - `isDlnaMode` is on (the tab is mirroring an active DLNA session).
+ *   - `applyingRemoteUpdate` is off (we're not in the middle of applying
+ *     a server-driven state change — forwarding it back would loop).
+ *   - The current `sessionRpcSender` is a WS client (Electron IPC
+ *     keeps the legacy local-mutation + `playUrl` path).
+ */
+function shouldForwardToServer(): boolean {
+    const state = usePlayerStoreBase.getState();
+    return (
+        state.isDlnaMode &&
+        !state.applyingRemoteUpdate &&
+        sessionRpcSender !== null &&
+        sessionRpcSender.isWsClient
+    );
+}
+
 const initialState: State = {
+    applyingRemoteUpdate: false,
     hydrated: false,
+    isDlnaMode: false,
     player: {
         crossfadeDuration: 5,
         crossfadeStyle: CrossfadeStyle.EQUAL_POWER,
@@ -357,6 +433,17 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
         subscribeWithSelector(
             immer((set, get) => ({
                 addToQueueByType: (items, playType, playSongId) => {
+                    // Phase E.2: server-authoritative DLNA mode forwards the
+                    // action to the server (the helper at call sites in
+                    // Phase E.6 pre-resolves URLs first; calls that don't
+                    // go through the helper still need to forward, but
+                    // will lack pre-resolved URLs — the server will
+                    // surface an error when it tries to playUrl).
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        const queueSongs = items.map(toQueueSong);
+                        void sessionRpcSender.queueAdd(queueSongs, playType, playSongId);
+                        return;
+                    }
                     const newItems = items.map(toQueueSong);
                     const newUniqueIds = newItems.map((item) => item._uniqueId);
 
@@ -595,6 +682,15 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     }
                 },
                 addToQueueByUniqueId: (items, uniqueId, edge, playSongId) => {
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        const queueSongs = items.map(toQueueSong);
+                        void sessionRpcSender.queueMove(
+                            queueSongs.map((s) => s._uniqueId),
+                            uniqueId,
+                            edge,
+                        );
+                        return;
+                    }
                     const newItems = items.map(toQueueSong);
                     const newUniqueIds = newItems.map((item) => item._uniqueId);
 
@@ -717,6 +813,10 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     }
                 },
                 clearQueue: () => {
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        void sessionRpcSender.queueClear();
+                        return;
+                    }
                     set((state) => {
                         state.player.index = -1;
                         state.queue.default = [];
@@ -1045,6 +1145,10 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     };
                 },
                 mediaNext: (toNextAlbum) => {
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        void sessionRpcSender.next(toNextAlbum);
+                        return;
+                    }
                     const state = get();
                     const currentIndex = state.player.index;
                     const player = state.player;
@@ -1130,11 +1234,23 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     });
                 },
                 mediaPause: () => {
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        void sessionRpcSender.sessionPause();
+                        return;
+                    }
                     set((state) => {
                         state.player.status = PlayerStatus.PAUSED;
                     });
                 },
                 mediaPlay: (id?: string) => {
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        if (id) {
+                            void sessionRpcSender.playByUniqueId(id);
+                        } else {
+                            void sessionRpcSender.sessionPlay();
+                        }
+                        return;
+                    }
                     let playIndex: number | undefined;
 
                     set((state) => {
@@ -1181,6 +1297,10 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     }
                 },
                 mediaPlayByIndex: (index: number) => {
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        void sessionRpcSender.playByIndex(index);
+                        return;
+                    }
                     let playIndex: number | undefined;
                     let songId: string | undefined;
 
@@ -1224,6 +1344,10 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     }
                 },
                 mediaPrevious: (toPreviousAlbum) => {
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        void sessionRpcSender.previous(toPreviousAlbum);
+                        return;
+                    }
                     const currentIndex = get().player.index;
                     const player = get().player;
                     const queue = get().getQueueOrder();
@@ -1275,6 +1399,10 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     });
                 },
                 mediaSeekToTimestamp: (timestamp: number) => {
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        void sessionRpcSender.sessionSeek(timestamp);
+                        return;
+                    }
                     // See mediaSkipBackward: update the timestamp store right away to
                     // avoid the stale-read left by the ~500ms engine poll.
                     setTimestampStore(timestamp);
@@ -1286,6 +1414,13 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     const offsetFromSettings =
                         useSettingsStore.getState().general.skipButtons.skipBackwardSeconds;
                     const timeToSkip = offset ?? offsetFromSettings ?? 5;
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        const currentTimestamp = useTimestampStoreBase.getState().timestamp;
+                        void sessionRpcSender.sessionSeek(
+                            Math.max(0, currentTimestamp - timeToSkip),
+                        );
+                        return;
+                    }
                     const currentTimestamp = useTimestampStoreBase.getState().timestamp;
                     const newTimestamp = Math.max(0, currentTimestamp - timeToSkip);
 
@@ -1315,6 +1450,11 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     const currentTimestamp = useTimestampStoreBase.getState().timestamp;
                     const newTimestamp = Math.min(duration - 1, currentTimestamp + timeToSkip);
 
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        void sessionRpcSender.sessionSeek(newTimestamp);
+                        return;
+                    }
+
                     // See mediaSkipBackward: update the timestamp store right away to
                     // avoid the stale-read left by the ~500ms engine poll.
                     setTimestampStore(newTimestamp);
@@ -1324,6 +1464,10 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                 },
                 mediaStop: (options?: { reset?: boolean }) => {
                     const reset = options?.reset !== false;
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        void sessionRpcSender.sessionStop();
+                        return;
+                    }
                     set((state) => {
                         state.player.status = PlayerStatus.STOPPED;
                         setTimestampStore(0);
@@ -1335,6 +1479,10 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     emitPlayerStop(get, reset);
                 },
                 mediaToggleMute: () => {
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        void sessionRpcSender.sessionSetMuted(!get().player.muted);
+                        return;
+                    }
                     set((state) => {
                         state.player.muted = !state.player.muted;
                     });
@@ -1344,6 +1492,19 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     // event so engines like mpv can reload the current track — play()
                     // alone is a no-op when mpv's playlist-pos is -1.
                     const wasStopped = get().player.status === PlayerStatus.STOPPED;
+
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        const newStatus =
+                            get().player.status === PlayerStatus.PLAYING
+                                ? PlayerStatus.PAUSED
+                                : PlayerStatus.PLAYING;
+                        if (wasStopped) {
+                            void sessionRpcSender.sessionPlay();
+                        } else {
+                            void sessionRpcSender.sessionSetStatus(newStatus);
+                        }
+                        return;
+                    }
 
                     set((state) => {
                         if (state.player.status === PlayerStatus.PLAYING) {
@@ -1359,6 +1520,11 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                 },
                 moveSelectedTo: (items: QueueSong[], uniqueId: string, edge: 'bottom' | 'top') => {
                     const itemUniqueIds = items.map((item) => item._uniqueId);
+
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        void sessionRpcSender.queueMove(itemUniqueIds, uniqueId, edge);
+                        return;
+                    }
 
                     set((state) => {
                         const existingIds = new Set(Object.keys(state.queue.songs));
@@ -1391,6 +1557,21 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     });
                 },
                 moveSelectedToBottom: (items: QueueSong[]) => {
+                    const uniqueIds = items.map((item) => item._uniqueId);
+
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        const known = new Set(Object.keys(get().queue.songs));
+                        if (uniqueIds.every((id) => known.has(id))) {
+                            const def = get().queue.default;
+                            const target = def[def.length - 1];
+                            if (target) {
+                                void sessionRpcSender.queueMove(uniqueIds, target, 'bottom');
+                            }
+                            return;
+                        }
+                        // Items not yet in queue — fall through; E.6 handles pre-resolved adds.
+                    }
+
                     set((state) => {
                         const uniqueIds = items.map((item) => item._uniqueId);
 
@@ -1411,6 +1592,21 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     });
                 },
                 moveSelectedToNext: (items: QueueSong[]) => {
+                    const uniqueIds = items.map((item) => item._uniqueId);
+
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        const known = new Set(Object.keys(get().queue.songs));
+                        if (uniqueIds.every((id) => known.has(id))) {
+                            const def = get().queue.default;
+                            const curIdx = get().player.index;
+                            const targetId = def[curIdx];
+                            if (targetId) {
+                                void sessionRpcSender.queueMove(uniqueIds, targetId, 'bottom');
+                            }
+                            return;
+                        }
+                    }
+
                     set((state) => {
                         const uniqueIds = items.map((item) => item._uniqueId);
 
@@ -1445,6 +1641,20 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     });
                 },
                 moveSelectedToTop: (items: QueueSong[]) => {
+                    const uniqueIds = items.map((item) => item._uniqueId);
+
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        const known = new Set(Object.keys(get().queue.songs));
+                        if (uniqueIds.every((id) => known.has(id))) {
+                            const def = get().queue.default;
+                            const target = def[0];
+                            if (target) {
+                                void sessionRpcSender.queueMove(uniqueIds, target, 'top');
+                            }
+                            return;
+                        }
+                    }
+
                     set((state) => {
                         const uniqueIds = items.map((item) => item._uniqueId);
 
@@ -1465,6 +1675,14 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     });
                 },
                 setQueue: (items, index, position) => {
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        // Items need pre-resolution before reaching the server. The cast
+                        // button (Phase E.7) handles this by building a snapshot with
+                        // pre-resolved URLs and calling sessionRpcSender.setQueue directly.
+                        // If we ever arrive here in DLNA mode without that path, no-op
+                        // rather than mutate locally and desync.
+                        return;
+                    }
                     const newItems = items.map(toQueueSong);
                     const newUniqueIds = newItems.map((item) => item._uniqueId);
 
@@ -1503,11 +1721,19 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     });
                 },
                 setRepeat: (repeat: PlayerRepeat) => {
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        void sessionRpcSender.sessionSetRepeat(repeat);
+                        return;
+                    }
                     set((state) => {
                         state.player.repeat = repeat;
                     });
                 },
                 setShuffle: (shuffle: PlayerShuffle) => {
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        void sessionRpcSender.sessionSetShuffle(shuffle);
+                        return;
+                    }
                     set((state) => {
                         const wasShuffled = state.player.shuffle === PlayerShuffle.TRACK;
                         const willBeShuffled = shuffle === PlayerShuffle.TRACK;
@@ -1549,6 +1775,10 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     });
                 },
                 setSpeed: (speed: number) => {
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        void sessionRpcSender.sessionSetSpeed(speed);
+                        return;
+                    }
                     set((state) => {
                         const normalizedSpeed = Math.max(0.5, Math.min(2, speed));
                         state.player.speed = normalizedSpeed;
@@ -1560,11 +1790,19 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     });
                 },
                 setVolume: (volume: number) => {
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        void sessionRpcSender.sessionSetVolume(volume);
+                        return;
+                    }
                     set((state) => {
                         state.player.volume = volume;
                     });
                 },
                 shuffle: () => {
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        void sessionRpcSender.queueShuffle();
+                        return;
+                    }
                     set((state) => {
                         if (state.player.shuffle === PlayerShuffle.TRACK) {
                             state.queue.shuffled = generateShuffledIndexes(
@@ -1574,6 +1812,10 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     });
                 },
                 shuffleAll: () => {
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        void sessionRpcSender.queueShuffle();
+                        return;
+                    }
                     set((state) => {
                         const queue = state.getQueue();
                         const currentIndex = state.player.index;
@@ -1612,6 +1854,11 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     });
                 },
                 shuffleSelected: (items: QueueSong[]) => {
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        // No direct RPC; use queueShuffle (server reshuffles entire queue).
+                        void sessionRpcSender.queueShuffle();
+                        return;
+                    }
                     set((state) => {
                         const itemUniqueIds = items.map((item) => item._uniqueId);
 
@@ -1646,6 +1893,17 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     });
                 },
                 toggleRepeat: () => {
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        const cur = get().player.repeat;
+                        const next =
+                            cur === PlayerRepeat.NONE
+                                ? PlayerRepeat.ONE
+                                : cur === PlayerRepeat.ONE
+                                  ? PlayerRepeat.ALL
+                                  : PlayerRepeat.NONE;
+                        void sessionRpcSender.sessionSetRepeat(next);
+                        return;
+                    }
                     set((state) => {
                         if (state.player.repeat === PlayerRepeat.NONE) {
                             state.player.repeat = PlayerRepeat.ONE;
@@ -1657,6 +1915,14 @@ export const usePlayerStoreBase = createWithEqualityFn<PlayerState>()(
                     });
                 },
                 toggleShuffle: () => {
+                    if (shouldForwardToServer() && sessionRpcSender) {
+                        const next =
+                            get().player.shuffle === PlayerShuffle.TRACK
+                                ? PlayerShuffle.NONE
+                                : PlayerShuffle.TRACK;
+                        void sessionRpcSender.sessionSetShuffle(next);
+                        return;
+                    }
                     set((state) => {
                         const wasShuffled = state.player.shuffle === PlayerShuffle.TRACK;
                         const willBeShuffled = state.player.shuffle !== PlayerShuffle.TRACK;
@@ -2277,6 +2543,18 @@ export const usePlayerQueue = () => {
     );
 };
 
+export function toQueueSong(item: Song): QueueSong {
+    return {
+        ...item,
+        _uniqueId: nanoid(),
+    };
+}
+
+// We need to use a unique id so that the equalityFn can work if attempting to set the same timestamp
+export function uniqueSeekToTimestamp(timestamp: number) {
+    return `${timestamp}-${nanoid()}`;
+}
+
 function cleanupOrphanedSongs(state: any): boolean {
     const allQueueIds = new Set([
         ...state.queue.default,
@@ -2362,16 +2640,4 @@ function recalculatePlayerIndex(state: any, queue: string[]) {
 
     const index = queue.findIndex((id) => id === currentTrack._uniqueId);
     state.player.index = Math.max(0, index);
-}
-
-function toQueueSong(item: Song): QueueSong {
-    return {
-        ...item,
-        _uniqueId: nanoid(),
-    };
-}
-
-// We need to use a unique id so that the equalityFn can work if attempting to set the same timestamp
-function uniqueSeekToTimestamp(timestamp: number) {
-    return `${timestamp}-${nanoid()}`;
 }

@@ -1,0 +1,23 @@
+# Build artifacts — never ship these, they bloat the context massively
+dist
+out
+build
+node_modules
+
+# Version control & editor cruft
+.git
+.vscode
+.idea
+.claude
+
+# Logs & temp files
+*.log
+*.tmp
+
+# Dockerfiles themselves don't belong in the build context
+Dockerfile*
+docker-compose*
+
+# Docs & non-runtime misc
+docs
+.github

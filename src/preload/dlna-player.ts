@@ -1,44 +1,19 @@
+import type {
+    ConnectResult,
+    DlnaDevice,
+    GroupMember,
+    SpeakerProperties,
+    SpeedFileData,
+    TrackMetadata,
+} from '/@/shared/types/dlna';
+
 import { ipcRenderer, IpcRendererEvent } from 'electron';
 
-export interface DlnaDevice {
-    controlUrl: string;
-    groupCoordinatorId?: string;
-    groupMembers?: DlnaDevice[];
-    id: string;
-    isPair?: boolean;
-    location: string;
-    name: string;
-    renderingControlUrl: string;
-}
-
-export interface GroupMember {
-    device: DlnaDevice;
-    isCoordinator: boolean;
-    volume: number;
-}
-
-export interface TrackMetadata {
-    albumArtUrl?: string;
-    albumName?: string;
-    artistName?: string;
-    autoPlay?: boolean;
-    duration?: number;
-    mimeType?: string;
-    title: string;
-}
+export type { ConnectResult, DlnaDevice, GroupMember, SpeakerProperties, TrackMetadata };
 
 const discover = (): Promise<DlnaDevice[]> => ipcRenderer.invoke('dlna-discover');
-const connect = (
-    device: DlnaDevice,
-): Promise<{
-    currentDuration: number;
-    currentPosition: number;
-    currentTransportState: string;
-    currentUri: string;
-    nextUri: string;
-    success: boolean;
-    volume: number;
-}> => ipcRenderer.invoke('dlna-connect', device);
+const connect = (device: DlnaDevice): Promise<ConnectResult> =>
+    ipcRenderer.invoke('dlna-connect', device);
 const disconnect = (): Promise<boolean> => ipcRenderer.invoke('dlna-disconnect');
 const disconnectPassive = (): Promise<boolean> => ipcRenderer.invoke('dlna-disconnect-passive');
 const playUrl = (
@@ -108,28 +83,17 @@ const rendererDlnaGroupMemberVolume = (
 const rendererDlnaDiscoveryUpdate = (
     cb: (event: IpcRendererEvent, devices: DlnaDevice[]) => void,
 ) => singleOn('renderer-dlna-discovery-update', cb);
-const prepareSpeedFile = (data: {
-    offset: number;
-    preservePitch: boolean;
-    speed: number;
-    url: string;
-}) => ipcRenderer.invoke('dlna-prepare-speed-file', data);
-const checkSpeedFile = (data: {
-    preservePitch: boolean;
-    speed: number;
-    url: string;
-}): Promise<null | string> => ipcRenderer.invoke('dlna-check-speed-file', data);
-const cancelSpeedFile = (data: { preservePitch: boolean; speed: number; url: string }) =>
+const prepareSpeedFile = (data: SpeedFileData) =>
+    ipcRenderer.invoke('dlna-prepare-speed-file', data);
+const checkSpeedFile = (data: Omit<SpeedFileData, 'offset'>): Promise<null | string> =>
+    ipcRenderer.invoke('dlna-check-speed-file', data);
+const cancelSpeedFile = (data: Omit<SpeedFileData, 'offset'>) =>
     ipcRenderer.send('dlna-cancel-speed-file', data);
 
 const getSpeakerProperties = (deviceId: string): Promise<null | SpeakerProperties> =>
     ipcRenderer.invoke('dlna-get-speaker-properties', deviceId);
-const createSpeedProxy = (data: {
-    offset: number;
-    preservePitch: boolean;
-    speed: number;
-    url: string;
-}): Promise<null | string> => ipcRenderer.invoke('dlna-create-speed-proxy', data);
+const createSpeedProxy = (data: SpeedFileData): Promise<null | string> =>
+    ipcRenderer.invoke('dlna-create-speed-proxy', data);
 const destroySpeedProxy = () => ipcRenderer.send('dlna-destroy-speed-proxy');
 
 const setSpeakerProperty = (
@@ -179,18 +143,18 @@ export const dlnaPlayerListener = {
     rendererDlnaTrackEnded,
     rendererDlnaTransportState,
     rendererDlnaVolume,
+    rendererPlayerState: (_cb: never) => {
+        // Server-authoritative session events (Phase D) are WS-only — the
+        // Electron IPC path never fires them. Stub included so the
+        // adapter's `dlnaPlayerListener[event](wrapped)` indexing
+        // typechecks when called with these event names (which it never is).
+    },
+    rendererQueueState: (_cb: never) => {
+        // See rendererPlayerState above — same rationale.
+    },
     rendererTrackEnded,
 };
 
 export type DlnaPlayer = typeof dlnaPlayer;
 
 export type DlnaPlayerListener = typeof dlnaPlayerListener;
-
-export interface SpeakerProperties {
-    bass: number;
-    crossfade: boolean;
-    ledState: boolean;
-    loudness: boolean;
-    touchControls: boolean;
-    treble: number;
-}

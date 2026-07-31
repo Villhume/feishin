@@ -1,9 +1,15 @@
-// ssdp-discovery.ts
+import type { DlnaDevice } from '/@/shared/types/dlna';
+
+/**
+ * SSDP M-SEARCH discovery for DLNA MediaRenderers.
+ *
+ * Extracted from src/main/features/core/dlna/ssdp-discovery.ts so the
+ * same code serves both the Electron main process and the standalone
+ * casting server. The only change is the import path for `DlnaDevice`.
+ */
 import dgram from 'dgram';
 import http from 'http';
 import os from 'os';
-
-import { DlnaDevice } from './soap-client';
 
 const MEDIA_RENDERER_URN = 'urn:schemas-upnp-org:device:MediaRenderer:1';
 const AV_TRANSPORT_URN = 'urn:schemas-upnp-org:service:AVTransport:1';

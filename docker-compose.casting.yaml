@@ -1,0 +1,67 @@
+# Standalone casting server for Feishin's web/Docker deployment.
+#
+# This service lets the browser-based Feishin client talk to DLNA devices
+# on the local network. The browser opens a WebSocket to this server, and
+# the server performs the actual SOAP/UPnP/SSDP work (web pages cannot).
+#
+# Two networking modes:
+#
+#   1. host (default for ease-of-use)
+#      Required for SSDP discovery and to let devices call back to the
+#      event server. Lets the container reach arbitrary LAN IPs without
+#      extra routing. Works on Linux only — not supported on Docker
+#      Desktop for Mac/Windows https://docs.docker.com/network/host/.
+#
+#   2. bridge
+#      Works cross-platform but requires:
+#        - OVERRIDE_LAN_IP set to the Docker host's LAN IP (so devices
+#          can reach the event server).
+#        - DISABLE_EVENT_SUBSCRIPTION=true, since UPnP event callbacks
+#          land on the container's internal IP, which devices can't
+#          route to. The server falls back to polling.
+#        - Manual device selection (discovery won't find devices). Use
+#          the Cast button → "Add Server" or pre-populate `cast.servers`
+#          in Feishin settings.
+#
+# Browse to Feishin → Settings → Playback → Cast → Server URLs and add
+# ws://<docker-host-ip>:8180 (or the auth-token-protected variant).
+
+services:
+    feishin-casting:
+        container_name: feishin-casting
+        build:
+            context: .
+            dockerfile: Dockerfile.casting
+        image: ghcr.io/jeffvli/feishin-casting:latest
+        restart: unless-stopped
+
+        # --- Host networking (Linux-only, recommended for ease of use) ---
+        # network_mode: host
+
+        # --- Bridge networking (cross-platform) ---
+        ports:
+            - 8180:8180
+
+        environment:
+            # WebSocket + HTTP /health listen port.
+            - PORT=8180
+
+            # Optional bearer token. If set, browsers must send it via the
+            # `?token=` query param on the WS URL. Leave empty for no auth.
+            # Generate one with: node -e "console.log(require('crypto').randomBytes(18).toString('base64url'))"
+            - AUTH_TOKEN=
+
+            # Optional override for the IP that gets baked into device
+            # callback URLs. In bridge mode set this to the Docker host's
+            # LAN IP (e.g. 192.168.1.10). Leave empty in host mode.
+            - OVERRIDE_LAN_IP=
+
+            # In bridge mode set to `true` — UPnP event subscription will
+            # silently fail because devices can't reach the container.
+            # The server falls back to position/state polling.
+            - DISABLE_EVENT_SUBSCRIPTION=false
+
+            # Optional path to ffmpeg. Defaults to `ffmpeg` on PATH, which
+            # is installed in the runtime image. Override only if you need
+            # a custom build (e.g. for codec support).
+            - FFMPEG_PATH=

@@ -34,6 +34,7 @@ const createConfig = (isDevelopment: boolean): UserConfig => ({
         resolve: {
             alias: {
                 '/@/main': resolve('src/main'),
+                '/@/server': resolve('src/server'),
                 '/@/shared': resolve('src/shared'),
             },
         },

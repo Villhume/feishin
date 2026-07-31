@@ -7,6 +7,7 @@ import { useTranslation } from 'react-i18next';
 import { queryKeys } from '/@/renderer/api/query-keys';
 import { albumQueries } from '/@/renderer/features/albums/api/album-api';
 import { artistsQueries } from '/@/renderer/features/artists/api/artists-api';
+import { enqueueWithResolvedUrls } from '/@/renderer/features/player/api/dlna-session-sync';
 import {
     filterSongsByPlayerFilters,
     getAlbumArtistSongsById,
@@ -236,7 +237,16 @@ export const PlayerProvider = ({ children }: { children: React.ReactNode }) => {
                     uniqueId: type.uniqueId,
                 });
 
-                storeActions.addToQueueByUniqueId(filteredData, type.uniqueId, edge, playSongId);
+                // In DLNA mode, `enqueueWithResolvedUrls` pre-resolves
+                // stream URLs + album art + MIME types before forwarding
+                // via the `queueAdd` RPC.  In non-DLNA mode it delegates
+                // to the store-level `addToQueueByData`, which calls
+                // `storeActions.addToQueueByUniqueId` internally.
+                void enqueueWithResolvedUrls(
+                    filteredData,
+                    { edge, uniqueId: type.uniqueId },
+                    playSongId,
+                );
             } else {
                 logger.debug('Added to queue by type', {
                     data: data.length,
@@ -244,10 +254,10 @@ export const PlayerProvider = ({ children }: { children: React.ReactNode }) => {
                     type,
                 });
 
-                storeActions.addToQueueByType(filteredData, type as Play, playSongId);
+                void enqueueWithResolvedUrls(filteredData, type, playSongId);
             }
         },
-        [storeActions],
+        [],
     );
 
     const addToQueueByFetch = useCallback(
@@ -326,9 +336,11 @@ export const PlayerProvider = ({ children }: { children: React.ReactNode }) => {
 
                 if (typeof type === 'object' && 'edge' in type && type.edge !== null) {
                     const edge = type.edge === 'top' ? 'top' : 'bottom';
-                    storeActions.addToQueueByUniqueId(filteredSongs, type.uniqueId, edge);
+                    // See `addToQueueByData` above — route through the
+                    // DLNA-aware helper (no-op in non-DLNA mode).
+                    await enqueueWithResolvedUrls(filteredSongs, { edge, uniqueId: type.uniqueId });
                 } else {
-                    storeActions.addToQueueByType(filteredSongs, type as Play);
+                    await enqueueWithResolvedUrls(filteredSongs, type);
                 }
             } catch (err: any) {
                 if (instanceOfCancellationError(err)) {
@@ -347,7 +359,7 @@ export const PlayerProvider = ({ children }: { children: React.ReactNode }) => {
                 });
             }
         },
-        [queryClient, storeActions, t],
+        [queryClient, t],
     );
 
     const addToQueueByListQuery = useCallback(

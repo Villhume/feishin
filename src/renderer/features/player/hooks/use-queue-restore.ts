@@ -29,6 +29,12 @@ export const useQueueRestoreTimestamp = () => {
             onQueueRestored: (properties) => {
                 const { position } = properties;
 
+                // Skip in DLNA mode — the server is authoritative for
+                // position and the queue snapshot already applied it.
+                // Forwarding a seek here would send an RPC to the device
+                // and interrupt playback.
+                if (usePlayerStore.getState().isDlnaMode) return;
+
                 setTimeout(() => {
                     setTimestamp(position);
                     mediaSeekToTimestamp(position);
@@ -67,6 +73,14 @@ export const useInitialTimestampRestore = () => {
     }, []);
 
     const applyStartupSeek = useCallback(() => {
+        // Must check at call time — `onPlayerStatus` fires this AFTER
+        // `onHello` sets `isDlnaMode = true`, so the mount-effect guard
+        // (checked before `onHello`) is too early and the seek would
+        // still be armed when this fires.
+        if (usePlayerStore.getState().isDlnaMode) {
+            return;
+        }
+
         const seekTimestamp = startupSeekArmedRef.current;
 
         if (startupSeekAppliedRef.current) {
@@ -119,6 +133,17 @@ export const useInitialTimestampRestore = () => {
 
         startupRestoreInitializedRef.current = true;
         startupRestoreSessionHandled = true;
+
+        // Skip startup seek in DLNA mode — the server snapshot (applied
+        // via the `hello` handshake or `rendererQueueState` event) already
+        // has the correct position.  Forwarding a seek RPC here would
+        // interrupt playback on the device.  This was the root cause of
+        // audio stuttering when a new tab opens mid-session: this hook
+        // fired `mediaSeekToTimestamp` via `setTimeout(100)` after the
+        // `applyingRemoteUpdate` guard dropped, forwarding a seek RPC.
+        if (usePlayerStore.getState().isDlnaMode) {
+            return;
+        }
 
         if (timestamp > 0) {
             startupSeekArmedRef.current = timestamp;

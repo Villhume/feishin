@@ -699,6 +699,24 @@ const RemoteSettingsSchema = z.object({
     username: z.string(),
 });
 
+/**
+ * Cast settings — controls how the renderer discovers and connects to a
+ * standalone casting server when DLNA is used outside of Electron.
+ *
+ * In Electron, `cast.mode === 'auto'` falls back to the in-process IPC
+ * backend (no server required). In web/Docker, `'auto'` runs the probe
+ * sequence in `dlna-client-provider.tsx`.
+ *
+ * `servers` is a list of `ws://host:port` URLs to try, in order. The
+ * first that returns a valid `hello` is used. Empty list + auto mode =
+ * probe the default ports on `location.hostname` (see Phase 8).
+ */
+const CastSettingsSchema = z.object({
+    authToken: z.string().optional(),
+    mode: z.enum(['auto', 'manual', 'off']),
+    servers: z.array(z.string()),
+});
+
 const WindowSettingsSchema = z.object({
     disableAutoUpdate: z.boolean(),
     exitToTray: z.boolean(),
@@ -792,6 +810,7 @@ export const toServerTagAutocompleteSource = (tagName: string): string =>
  */
 export const ValidationSettingsStateSchema = z.object({
     autoDJ: AutoDJSettingsSchema,
+    cast: CastSettingsSchema,
     css: CssSettingsSchema,
     discord: DiscordSettingsSchema,
     font: FontSettingsSchema,
@@ -1231,6 +1250,14 @@ const initialState: SettingsState = {
         onlySimilar: false,
         songStrategy: AUTO_DJ_STRATEGY.SIMILAR,
         timing: 1,
+    },
+    cast: {
+        // Auto = use IPC backend in Electron, probe sequence in web.
+        // Users running the standalone server on a non-default port or with
+        // auth can switch to 'manual' and list `servers` explicitly.
+        authToken: undefined,
+        mode: 'auto',
+        servers: [],
     },
     css: {
         content: '',
@@ -2799,6 +2826,10 @@ export const useLyricsDisplaySettings = (key: string = 'default') =>
     useSettingsStore((state) => state.lyricsDisplay[key] || state.lyricsDisplay.default, shallow);
 
 export const useRemoteSettings = () => useSettingsStore((state) => state.remote, shallow);
+
+export const useCastSettings = () => useSettingsStore((state) => state.cast, shallow);
+
+export type CastSettings = ReturnType<typeof useCastSettings>;
 
 export const useFontSettings = () => useSettingsStore((state) => state.font, shallow);
 

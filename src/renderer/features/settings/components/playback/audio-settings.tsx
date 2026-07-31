@@ -3,6 +3,7 @@ import isElectron from 'is-electron';
 import { memo, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
+import { useDlnaClientContext } from '/@/renderer/features/player/api/use-dlna-client';
 import {
     SettingOption,
     SettingsSection,
@@ -109,6 +110,10 @@ export const AudioSettings = memo(() => {
     const audioDeviceId =
         playbackType === PlayerType.LOCAL ? settings.mpvAudioDeviceId : settings.audioDeviceId;
     const isCasting = settings.type === PlayerType.DLNA;
+    // DLNA is selectable when a backend is available — either the in-process
+    // Electron IPC bridge OR a connected standalone casting server.
+    const { client: dlnaClient, status: castStatus } = useDlnaClientContext();
+    const dlnaAvailable = !!dlnaClient || castStatus === 'connecting';
 
     // Dynamically build the options for the dropdown
     const selectData = [
@@ -135,9 +140,15 @@ export const AudioSettings = memo(() => {
                             value: PlayerType.LOCAL,
                         },
                         { label: 'Web', value: PlayerType.WEB },
+                        // Show DLNA option when:
+                        //   - currently casting (always, as a disabled placeholder so the
+                        //     user sees what's active and can't accidentally switch away mid-stream)
+                        //   - or a DLNA backend is available (Electron IPC or connected WS server)
                         ...(isCasting
                             ? [{ disabled: true, label: 'DLNA', value: PlayerType.DLNA }]
-                            : []),
+                            : dlnaAvailable
+                              ? [{ label: 'DLNA', value: PlayerType.DLNA }]
+                              : []),
                     ]}
                     defaultValue={settings.type}
                     disabled={status === PlayerStatus.PLAYING || isCasting}
@@ -148,7 +159,7 @@ export const AudioSettings = memo(() => {
                 />
             ),
             description: t('setting.audioPlayer', { context: 'description' }),
-            isHidden: !isElectron() && !isJukeboxSupported,
+            isHidden: !isElectron() && !isJukeboxSupported && !dlnaAvailable,
             note: status === PlayerStatus.PLAYING ? t('common.playerMustBePaused') : undefined,
             title: t('setting.audioPlayer'),
         },

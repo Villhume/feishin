@@ -4,6 +4,7 @@ import { shallow } from 'zustand/shallow';
 
 import { AudioSettings } from '/@/renderer/features/settings/components/playback/audio-settings';
 import { AutoDJSettings } from '/@/renderer/features/settings/components/playback/auto-dj-settings';
+import { CastSettings } from '/@/renderer/features/settings/components/playback/cast-settings';
 import { EqSettings } from '/@/renderer/features/settings/components/playback/eq-settings';
 import { PlayerFilterSettings } from '/@/renderer/features/settings/components/playback/player-filter-settings';
 import { TranscodeSettings } from '/@/renderer/features/settings/components/playback/transcode-settings';
@@ -37,6 +38,7 @@ export const PlaybackTab = memo(() => {
     return (
         <Stack gap="md">
             <AudioSettings />
+            <CastSettings />
             <Suspense fallback={<></>}>{hasFancyAudio && <MpvSettings />}</Suspense>
             <EqSettings />
             <Divider />

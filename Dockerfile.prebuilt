@@ -1,0 +1,27 @@
+# Variant of Dockerfile that skips the in-container web build.
+#
+# Use this if the full build (vite + PWA + workbox) OOM-crashes the
+# docker-desktop WSL VM — the web bundle is memory-heavy and the
+# container build is much larger than the host build.
+#
+# Workflow:
+#   1. Run `pnpm run build:web` on the host (around 1 minute)
+#   2. `docker compose -f docker-compose.all.yaml build feishin`
+#      (still uses this Dockerfile.prebuilt via build.dockerfile)
+#   3. `docker compose -f docker-compose.all.yaml up`
+#
+# The .dockerignore still excludes `out/` for the casting server build,
+# so we use a separate .dockerignore.prebuilt that allows `out/web/`
+# through.
+
+FROM nginxinc/nginx-unprivileged:alpine-slim
+
+COPY --chown=nginx:nginx ./out/web /usr/share/nginx/html
+COPY --chown=nginx:nginx ./settings.js.template /etc/nginx/templates/settings.js.template
+COPY --chown=nginx:nginx ng.conf.template /etc/nginx/templates/default.conf.template
+
+ENV SERVER_LOCK=false SERVER_NAME="" SERVER_TYPE="" SERVER_URL="" REMOTE_URL=""
+ENV LEGACY_AUTHENTICATION="" ANALYTICS_DISABLED="" PUBLIC_PATH="/"
+
+EXPOSE 9180
+CMD ["nginx", "-g", "daemon off;"]

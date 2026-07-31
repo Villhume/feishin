@@ -10,6 +10,7 @@ import isElectron from 'is-electron';
 import { lazy, memo, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 
 import i18n from '/@/i18n/i18n';
+import { DlnaClientProvider } from '/@/renderer/features/player/api/dlna-client-provider';
 import { WebAudioContext } from '/@/renderer/features/player/context/webaudio-context';
 import { useCheckForUpdates } from '/@/renderer/hooks/use-check-for-updates';
 import { useNativeMenuSync } from '/@/renderer/hooks/use-native-menu-sync';
@@ -96,10 +97,12 @@ const AppShell = memo(function AppShell() {
                 zIndex={50000}
             />
             <WebAudioContext.Provider value={webAudioProvider}>
-                <PlayerProvider>
-                    <AudioPlayers />
-                    <AppRouter />
-                </PlayerProvider>
+                <DlnaClientProvider>
+                    <PlayerProvider>
+                        <AudioPlayers />
+                        <AppRouter />
+                    </PlayerProvider>
+                </DlnaClientProvider>
             </WebAudioContext.Provider>
             <ReleaseNotesModal />
             <Suspense fallback={null}>
